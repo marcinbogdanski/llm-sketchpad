@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import tiktoken
+from pathlib import Path
 
 DATA_DIR = "/home/user/.cache/zerotohero-repro/data"
 
@@ -149,7 +150,8 @@ class GPTModel(nn.Module):
             return logits, loss
 
 
-class DataLoaderShakespeare:
+class DataLoader:
+    """Simple data loader for Shakespeare dataset"""
     def __init__(self, data_path, batch_size, block_size, proc_rank, world_size):
         self.data_path = data_path
         self.batch_size = batch_size
@@ -171,44 +173,6 @@ class DataLoaderShakespeare:
 
         self.pos += self.batch_size * self.block_size * self.world_size
         if self.pos + self.batch_size * self.block_size * self.world_size + 1 > len(self.tokens):
-            self.pos = self.batch_size * self.block_size * self.proc_rank
-
-        return x, y
-
-class DataLoader:
-    def __init__(self, data_path, batch_size, block_size, proc_rank, world_size, split):
-        self.data_path = data_path
-        self.batch_size = batch_size
-        self.block_size = block_size
-        self.proc_rank = proc_rank
-        self.world_size = world_size
-        assert split in ['train', 'val']
-        self.split = split
-
-        # Read shard file names
-        self.shards = os.listdir(data_path)
-        self.shards = sorted([s for s in self.shards if self.split in s])
-        self.reset()
-
-    def load_shard(self, shard_idx):
-        filepath = os.path.join(self.data_path, self.shards[shard_idx])
-        tokens_np = np.load(filepath).astype(np.int32)
-        return torch.tensor(tokens_np, dtype=torch.long)
-
-    def reset(self):
-        self.current_shard = 0
-        self.tokens = self.load_shard(self.current_shard)
-        self.pos = self.batch_size * self.block_size * self.proc_rank
-
-    def get_batch(self):
-        buff = self.tokens[self.pos:self.pos+self.batch_size*self.block_size+1]
-        x = buff[:-1].view(self.batch_size, self.block_size)
-        y = buff[1:].view(self.batch_size, self.block_size)
-
-        self.pos += self.batch_size * self.block_size * self.world_size
-        if self.pos + self.batch_size * self.block_size * self.world_size + 1 > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = self.load_shard(self.current_shard)
             self.pos = self.batch_size * self.block_size * self.proc_rank
 
         return x, y
@@ -252,18 +216,8 @@ def main():
         device_type = device
     print(f"{ddp=} {ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
 
-    # NOTE: Only affects perforamnce if autocast is *not* used
-    # Option 1 - old API
-    # torch.set_float32_matmul_precision("high")        # in video, causes deprecated warning
-    # Option 2 - new API
-    # Note = 'tf32' is the correct way as per torch 2.9 docs
-    # assert torch.backends.cuda.matmul.fp32_precision    # check they exist
-    # assert torch.backends.cudnn.conv.fp32_precision
-    # torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
-    # torch.backends.cudnn.conv.fp32_precision = 'tf32'
-    # Option 3 - compatible with generation
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    # Enable TF32 for matmul
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
 
     # Reproducibility
     # Model init relies on identical random seeds, will address later
@@ -271,8 +225,6 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
         torch.cuda.manual_seed_all(42)
-    
-
 
     # Batching
     total_batch_size = 524288    # 2**19, ~0.5M
@@ -284,22 +236,13 @@ def main():
         print(f"{total_batch_size=}, {block_size=}, {micro_batch=}, {ddp_world_size=}, {grad_accum=}")
 
     # Data Loader
-    fineweb_dir = os.path.join(DATA_DIR, "fineweb-edu-sample-10BT")
+    data_path = Path(__file__).resolve().parent.parent.parent.parent / "data" / "tinyshakespeare.txt"
     train_loader = DataLoader(
-        data_path=fineweb_dir,
+        data_path=data_path,
         batch_size=micro_batch,
         block_size=block_size,
         proc_rank=ddp_rank,
         world_size=ddp_world_size,
-        split='train',
-    )
-    val_loader = DataLoader(
-        data_path=fineweb_dir,
-        batch_size=micro_batch,
-        block_size=block_size,
-        proc_rank=ddp_rank,
-        world_size=ddp_world_size,
-        split='val',
     )
 
     # Model
@@ -400,9 +343,7 @@ def main():
         tps = ntok / dt
         if ddp_master:
             pct = (i+1) / max_steps * 100
-            cs = train_loader.current_shard
-            cp = train_loader.pos
-            print(f"{i:4d} ({pct:.2f}%) [{cs};{cp:,}]:, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+            print(f"{i:4d} ({pct:.2f}%):, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
         
 
     if ddp:
