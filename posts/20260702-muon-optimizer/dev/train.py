@@ -3,7 +3,6 @@ import math
 import time
 import inspect
 from dataclasses import dataclass
-from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,9 +33,13 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()
+
+        # Compute query, key, value
         q = self.c_q(x)  # B,T,C
         k = self.c_k(x)  # B,T,C
         v = self.c_v(x)  # B,T,C
+
+        # Reshape for multi-head attention
         q = q.view(B, T, self.n_head, C//self.n_head)  # B,T,nh,hs
         k = k.view(B, T, self.n_head, C//self.n_head)  # B,T,nh,hs
         v = v.view(B, T, self.n_head, C//self.n_head)  # B,T,nh,hs
@@ -44,16 +47,15 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)  # B,nh,T,hs
         v = v.transpose(1, 2)  # B,nh,T,hs
 
-        # W_affin = q @ k.mT / k.shape[-1]**0.5  # B,nh,T,hs @ B,nh,hs,T -> B,nh,T,T
-        # W_affin = W_affin.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf'))
-        # W_affin = torch.softmax(W_affin, dim=-1)  # B,nh,T,T
-        # y = W_affin @ v    # B,nh,T,T @ B,nh,T,hs -> B,nh,T,hs
+        # Scaled dot-product attention with causal masking
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
+        # Merge heads
         y = y.transpose(1, 2)  # B,T,nh,hs
         y = y.contiguous()
         y = y.view(B,T,C)
 
+        # Output projection
         out = self.c_proj(y)
         return out
 
@@ -123,7 +125,7 @@ class GPTModel(nn.Module):
         torch.nn.init.normal_(self.transformer.wpe.weight, mean=0.0, std=0.02)
         # NOTE: lm_head is tied to wte, so no need to init it separately
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets):
         B, T = idx.shape
         assert T <= self.config.block_size
         
@@ -139,14 +141,12 @@ class GPTModel(nn.Module):
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)   # B,T,V <- B,T,E
 
-        if targets is None:
-            return logits, None
-        else:
-            B, T, C = logits.shape
-            logits_ = logits.view(B*T, C)  # B*T, C
-            targets_ = targets.view(B*T)   # B*T
-            loss = F.cross_entropy(logits_, targets_)
-            return logits, loss
+        # Loss
+        B, T, C = logits.shape
+        logits_ = logits.view(B*T, C)  # B*T, C
+        targets_ = targets.view(B*T)   # B*T
+        loss = F.cross_entropy(logits_, targets_)
+        return loss
 
 
 class DataLoader:
@@ -194,26 +194,20 @@ class LRScheduler:
             return self.min_lr
 
 def main():
+    assert torch.cuda.is_available(), "CUDA is required for this training script."
+    assert 'RANK' in os.environ, "Must be run with torchrun for DDP."
+
     # DDP Init
-    ddp = int(os.environ.get('RANK', -1)) != -1  # is this ddp run?
-    if ddp:
-        ddp_rank = int(os.environ['RANK'])
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        ddp_world_size = int(os.environ['WORLD_SIZE'])
-        ddp_master = ddp_rank == 0  # is this a master?
-        device = f'cuda:{ddp_local_rank}'
-        device_type = 'cuda'
-        assert torch.cuda.is_available()
-        torch.cuda.set_device(device)
-        torch.distributed.init_process_group(backend='nccl', device_id=ddp_local_rank)  # device_id= to suppress barrier warning
-    else:
-        ddp_rank = 0
-        ddp_local_rank = 0
-        ddp_world_size = 1
-        ddp_master = True
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        device_type = device
-    print(f"{ddp=} {ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    ddp_master = ddp_rank == 0  # is this a master?
+    device = f'cuda:{ddp_local_rank}'
+    device_type = 'cuda'
+    assert torch.cuda.is_available()
+    torch.cuda.set_device(device)
+    torch.distributed.init_process_group(backend='nccl', device_id=ddp_local_rank)  # device_id= to suppress barrier warning
+    print(f"{ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
 
     # Enable TF32 for matmul
     torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
@@ -221,24 +215,21 @@ def main():
     # Reproducibility
     # Model init relies on identical random seeds, will address later
     torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-        torch.cuda.manual_seed_all(42)
+    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
 
     # Batching
-    total_batch_size = 524288    # 2**19, ~0.5M
-    micro_batch = 16             # what fits in GPU
+    batch_size = 16             # what fits in GPU
     block_size = 1024
-    assert total_batch_size % (block_size*micro_batch*ddp_world_size) == 0
-    grad_accum = total_batch_size // (block_size*micro_batch*ddp_world_size)
+    
     if ddp_master:
-        print(f"{total_batch_size=}, {block_size=}, {micro_batch=}, {ddp_world_size=}, {grad_accum=}")
+        print(f"{block_size=}, {batch_size=}, {ddp_world_size=}")
 
     # Data Loader
     data_path = Path(__file__).resolve().parent.parent.parent.parent / "data" / "tinyshakespeare.txt"
     train_loader = DataLoader(
         data_path=data_path,
-        batch_size=micro_batch,
+        batch_size=batch_size,
         block_size=block_size,
         proc_rank=ddp_rank,
         world_size=ddp_world_size,
@@ -255,16 +246,13 @@ def main():
     ))
     model.to(device)
     model = torch.compile(model)
-    if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
-
-
+    model = DDP(model, device_ids=[ddp_local_rank])
 
     # LR Scheduler
-    max_lr = 6e-4              # params from GPT-3 paper, 124M model
+    max_lr = 6e-4
     min_lr = max_lr * 0.1
-    warmup_steps = 715         # 375M tokens / 2**19 tok = 715 steps
-    max_steps = 19073          # 10B tokens / 2**19 tok = 19073 - 1 epoch
+    warmup_steps = 50
+    max_steps = 500
     lr_scheduler = LRScheduler(max_lr, min_lr, warmup_steps=warmup_steps, max_steps=max_steps)
 
     # Optimizer
@@ -285,49 +273,30 @@ def main():
         print(f"Decay {len(decay_params)} tensors with {num_decay} params")
         print(f"Nodecay {len(nodecay_params)} tensors with {num_nodecay} params")
     # Check if fused adam
-    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    use_fused = fused_available and 'cuda' in device
-    if ddp_master:
-        print(f"Using fused AdamW: {use_fused}")
     optimizer = torch.optim.AdamW(
         optim_groups,
         lr=max_lr,
         betas=(0.9, 0.95),
         eps=1e-8,
-        fused=use_fused,
+        fused=True,
     )
 
+    ########################################
+    # Training step
     for i in range(max_steps):
-       
-
-        ########################################
-        # Training step
         model.train()
         ts = time.time()
 
-        # Calc gradient
-        loss_accum = 0.0
-        optimizer.zero_grad()
-        for ii in range(grad_accum):
-            x, y = train_loader.get_batch()
-            x, y = x.to(device), y.to(device)
-            # autocast to bfloat16 hangs in backward() on CPU
-            # https://docs.pytorch.org/tutorials/recipes/recipes/amp_recipe.html
-            autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == 'cuda' else nullcontext()
-            with autocast_ctx:
-                _, loss = model(x, y)
-            loss /= grad_accum
-            loss_accum += loss.detach()
-            # Sync only if DDP and last backward step
-            context = model.no_sync() if (ddp and ii < grad_accum - 1) else nullcontext()
-            with context:
-                loss.backward()
-        if ddp:
-            torch.distributed.all_reduce(loss_accum, op=torch.distributed.ReduceOp.AVG)
-            
-        # Gradient norm clip
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # Zero grad
+        optimizer.zero_grad(set_to_none=True)
 
+        # Calc gradient
+        x, y = train_loader.get_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            loss = model(x, y)
+        loss.backward()
+        
         # Optimizer step
         lr = lr_scheduler.get_lr(i)
         for pg in optimizer.param_groups:
@@ -338,15 +307,12 @@ def main():
         if device.startswith('cuda'):
             torch.cuda.synchronize() # wait for the GPU to finish work
         dt = (time.time() - ts)
-        ntok = (micro_batch * block_size * grad_accum* ddp_world_size)
+        ntok = (batch_size * block_size * ddp_world_size)
         tps = ntok / dt
         if ddp_master:
-            pct = (i+1) / max_steps * 100
-            print(f"{i:4d} ({pct:.2f}%):, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+            print(f"{i:4d}: loss(rank0)={loss.item():.6f}, lr={lr:.4e}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
         
-
-    if ddp:
-        torch.distributed.destroy_process_group()
+    torch.distributed.destroy_process_group()
     print("Bye")
 
 
