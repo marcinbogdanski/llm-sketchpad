@@ -1,19 +1,15 @@
 import os
 import math
 import time
-import json
 import inspect
 from dataclasses import dataclass
 from contextlib import nullcontext
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import tiktoken
 from pathlib import Path
-
-DATA_DIR = "/home/user/.cache/zerotohero-repro/data"
 
 @dataclass
 class GPTConfig:
@@ -24,22 +20,23 @@ class GPTConfig:
     n_embd: int
 
 
-class CausalSelfAttentionMarcin(nn.Module):
-    """Multiple self-attention heads"""
+class CausalSelfAttention(nn.Module):
+    """Multi-head masked self-attention layer with a projection at the end"""
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.n_head = config.n_head
 
-        self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1  # flag to scale proj into residual
-        # self.register_buffer('bias', torch.tril(torch.ones((1, 1, config.block_size, config.block_size))))
+        self.c_q = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_k = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_v = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         B, T, C = x.size()
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(C, dim=2)  # B, T, nh*hs
+        q = self.c_q(x)  # B,T,C
+        k = self.c_k(x)  # B,T,C
+        v = self.c_v(x)  # B,T,C
         q = q.view(B, T, self.n_head, C//self.n_head)  # B,T,nh,hs
         k = k.view(B, T, self.n_head, C//self.n_head)  # B,T,nh,hs
         v = v.view(B, T, self.n_head, C//self.n_head)  # B,T,nh,hs
@@ -64,10 +61,9 @@ class MLP(nn.Module):
     """Linear transform and activation"""
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4*config.n_embd)
+        self.c_fc = nn.Linear(config.n_embd, 4*config.n_embd, bias=False)
         self.act = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1  # flag to scale proj into residual
+        self.c_proj = nn.Linear(4*config.n_embd, config.n_embd, bias=False)
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -79,7 +75,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttentionMarcin(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -106,23 +102,26 @@ class GPTModel(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight
 
         # Init Params
-        self.apply(self._init_weights)
+        self.init_weights()
 
-    def _init_weights(self, module):
-        # note: wte/lm_head initialized twice, but that's ok
-        if isinstance(module, nn.Linear):
-            # 0.02 based on openai tensorflow source
-            # 1/sqrt(768) = 0.036, 0.02 is "roughly reasonable"
-            std = 0.02
-            if hasattr(module, "NANOGPT_SCALE_INIT"):
-                # each block project to residual 2x times: attention and MLP
-                num_layers = 2 * self.config.n_layer
-                std *= num_layers**-0.5
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def init_weights(self):
+        """Initialize the weights of the model."""
+        # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        s = 3**0.5 * self.config.n_embd**-0.5
+
+        for block in self.transformer.h:
+            # Attention
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            # MLP
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s*0.4, s*0.4)  # smaller init for feedforward
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.transformer.wpe.weight, mean=0.0, std=0.02)
+        # NOTE: lm_head is tied to wte, so no need to init it separately
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
