@@ -147,75 +147,7 @@ class GPTModel(nn.Module):
             targets_ = targets.view(B*T)   # B*T
             loss = F.cross_entropy(logits_, targets_)
             return logits, loss
-        
-    @classmethod
-    def from_pretrained(cls, model_name):
-        assert model_name == 'gpt2'  # for now
-        from transformers import GPT2LMHeadModel
-       
-        # HF Model
-        model_hf = GPT2LMHeadModel.from_pretrained('gpt2')
 
-        # Our Model
-        model = GPTModel(GPTConfig(
-            block_size=1024,     # max context length, max len feed into the model,
-            vocab_size=50257,    # 256 original, 50_000 merges, 1 <|end_of_doc|> token,
-            n_layer=12,
-            n_head=12,           # head size 384/6=64,
-            n_embd=768,          # size of embeddings, i.e. 'first layer',
-        ))
-        model.eval()
-
-        # Load weights from HF model
-        our_sd = model.state_dict()
-        our_keys = set(our_sd.keys())
-        our_keys = set(k for k in our_keys if not k.endswith('.attn.masked_bias'))
-        our_keys = set(k for k in our_keys if not k.endswith('.attn.bias'))
-        hf_sd = model_hf.state_dict()
-        hf_keys = set(hf_sd.keys())
-        hf_keys = set(k for k in hf_keys if not k.endswith('.attn.masked_bias'))
-        hf_keys = set(k for k in hf_keys if not k.endswith('.attn.bias'))
-        assert our_keys == hf_keys
-        for key in hf_keys:
-            hf_val = hf_sd[key]
-            hf_shape = hf_val.shape
-            our_shape = our_sd[key].shape
-            transpose = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-            if any(key.endswith(suffix) for suffix in transpose):
-                assert hf_shape[::-1] == our_shape
-                our_sd[key].copy_(hf_val.t().clone())
-            else:
-                assert hf_shape == our_shape
-                our_sd[key].copy_(hf_val.clone())
-
-        return model
-
-def generate(model, idx, max_new_tokens, top_k=50, sample_rng=None):
-    """Generate max_tokens starting from idx[B,T]"""
-    assert isinstance(idx, torch.Tensor)
-    assert idx.dtype == torch.long
-    assert len(idx.shape) == 2  # B,T
-    assert isinstance(max_new_tokens, int)
-    
-    is_training = model.training
-    model.eval()
-
-    block_size = model.config.block_size
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            idx_tail = idx[:, -block_size:]    # B,T  sliding window
-            context = torch.autocast(device_type=idx.device.type, dtype=torch.bfloat16) if idx.device.type == 'cuda' else nullcontext()
-            with context:
-                logits, _ = model(idx_tail)         # B,T,C <- B,T
-            logits = logits[:, -1, :]          # B,C <- B,T,C  discard all but last
-            probs = F.softmax(logits, dim=-1)  # B,C
-            topk_probs, topk_indices = torch.topk(probs, k=top_k, dim=-1)  # B,k
-            ix = torch.multinomial(topk_probs, num_samples=1, generator=sample_rng)  # B,1
-            xcol = torch.gather(topk_indices, -1, ix)          # B,1
-            idx = torch.cat((idx, xcol), dim=1)                # B,T+1  append
-    
-    model.train(is_training)
-    return idx
 
 class DataLoaderShakespeare:
     def __init__(self, data_path, batch_size, block_size, proc_rank, world_size):
@@ -243,11 +175,6 @@ class DataLoaderShakespeare:
 
         return x, y
 
-@dataclass
-class DataLoaderState:
-    current_shard: int
-    pos: int
-
 class DataLoader:
     def __init__(self, data_path, batch_size, block_size, proc_rank, world_size, split):
         self.data_path = data_path
@@ -262,12 +189,6 @@ class DataLoader:
         self.shards = os.listdir(data_path)
         self.shards = sorted([s for s in self.shards if self.split in s])
         self.reset()
-
-    def get_state(self):
-        return DataLoaderState(
-            current_shard=self.current_shard,
-            pos=self.pos,
-        )
 
     def load_shard(self, shard_idx):
         filepath = os.path.join(self.data_path, self.shards[shard_idx])
@@ -291,24 +212,6 @@ class DataLoader:
             self.pos = self.batch_size * self.block_size * self.proc_rank
 
         return x, y
-
-
-class HellaSwagRenderer:
-    def __init__(self):
-        self.tok = tiktoken.get_encoding("gpt2")
-    
-    def render_example(self, example):
-        ctx, ends, label = example["ctx"], example["endings"], example["label"]
-        ctx_ids = self.tok.encode(ctx)
-        ending_ids = [self.tok.encode(" " + ending) for ending in ends]  # " " because gpt2 tokenizer
-        result_length = max(len(eids) for eids in ending_ids) + len(ctx_ids)
-        tokens = torch.zeros((len(ends), result_length), dtype=torch.long)
-        mask = torch.zeros((len(ends), result_length), dtype=torch.long)
-        for i, eids in enumerate(ending_ids):
-            tokens[i, :len(ctx_ids)] = torch.tensor(ctx_ids, dtype=torch.long)
-            tokens[i, len(ctx_ids) : len(ctx_ids)+len(eids)] = torch.tensor(eids, dtype=torch.long)
-            mask[i, len(ctx_ids) : len(ctx_ids)+len(eids)] = 1
-        return tokens, mask, label
 
 
 class LRScheduler:
@@ -369,12 +272,7 @@ def main():
         torch.cuda.manual_seed(42)
         torch.cuda.manual_seed_all(42)
     
-    ################################ EQUIVALENCE ###############################
-    # Dissable TORCH.COMPILE for reproducibility non-DDP/DDP
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
-    # torch.use_deterministic_algorithms(True)
-    ############################################################################
+
 
     # Batching
     total_batch_size = 524288    # 2**19, ~0.5M
@@ -418,26 +316,7 @@ def main():
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
 
-    ################################ EQUIVALENCE ###############################
-    # - CUDA_VISIBLE_DEVICES=-1 python train_gpt2.py
-    # - python train_gpt2.py
-    # - torchrun --standalone --nproc_per_node=2 train_gpt2.py
-    # torch.set_printoptions(precision=10, sci_mode=True, linewidth=200)
-    # model_raw = model.module if ddp else model
-    # for r in range(ddp_world_size):
-    #     if ddp_local_rank == r:
-    #         print(f"--- [rank {ddp_local_rank}] ---", flush=True)
-    #         print("Init:")
-    #         print(model_raw.transformer.wte.weight[0, :10].detach().cpu())
-    #         print(model_raw.transformer.h[0].ln_1.weight[:10].detach().cpu())
-    #         print(model_raw.transformer.h[0].attn.c_attn.weight[0, :10].detach().cpu())
-    #         print(model_raw.transformer.h[0].mlp.c_proj.weight[0, :10].detach().cpu())
-    #         print(model_raw.transformer.ln_f.weight[:10].detach().cpu())
-    #         print(model_raw.lm_head.weight[0, :10].detach().cpu())
-    #         print(f"--- ----------------------- ---", flush=True)
-    #     if ddp:
-    #         torch.distributed.barrier()
-    ############################################################################
+
 
     # LR Scheduler
     max_lr = 6e-4              # params from GPT-3 paper, 124M model
@@ -476,149 +355,8 @@ def main():
         fused=use_fused,
     )
 
-    # Eval Params
-    eval_loss_every = 250  # steps
-    eval_accum_steps = 20   # steps
-    # Checkpoint
-    checkpoint_every = 5000  # steps
-    assert checkpoint_every % eval_loss_every == 0
-
-    # Generate Params
-    gen_samples_every = 250  # steps
-    tok = tiktoken.get_encoding("gpt2")
-    prompt = "Hello, I'm a language model,"  # 8 tokens
-    max_new_tokens = 24
-    num_generate = 4
-
-    # HellaSwag Stuff
-    # Read all lines from the validation set
-    hellaswag_every = 250  # steps
-    hellaswag_renderer = HellaSwagRenderer()
-    hellaswag_fp = os.path.join(DATA_DIR, "hellaswag", "hellaswag_val.jsonl")
-    with open(hellaswag_fp, "r") as f:
-        lines = f.readlines()
-    hellaswag_examples = [json.loads(line) for line in lines]
-
-    # Logging
-    logfile = "log.txt"
-    with open(logfile, 'w') as f:
-        pass  # clear logfile
-
-    total_tok = 0
     for i in range(max_steps):
-        
-        ########################################
-        # Evaluate validation loss
-        if (i % eval_loss_every) == 0 or (i == max_steps-1):
-            model.eval()
-            val_loader.reset()
-            ts = time.time()
-            loss_val_accum = 0.0    
-            with torch.no_grad():
-                for ii in range(eval_accum_steps):
-                    x, y = val_loader.get_batch()
-                    x, y = x.to(device), y.to(device)
-                    autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == 'cuda' else nullcontext()
-                    with autocast_ctx:
-                        _, loss = model(x, y)
-                    loss = loss / eval_accum_steps
-                    loss_val_accum += loss.detach()
-            if ddp:
-                torch.distributed.all_reduce(loss_val_accum, op=torch.distributed.ReduceOp.AVG)
-                    
-            # Logs
-            if device.startswith('cuda'):
-                torch.cuda.synchronize() # wait for the GPU to finish work
-            dt = (time.time() - ts)
-            tps = (micro_batch * block_size * eval_accum_steps * ddp_world_size) / dt
-            if ddp_master:
-                print(f"Eval at {i:4d}:, L={loss_val_accum.item():.6f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
-                with open(logfile, 'a') as f:
-                    f.write(f"val,{i},{total_tok},{loss_val_accum.item():.6f}\n")
-                if (i > 0 and (i % checkpoint_every) == 0) or (i == max_steps-1):
-                    model_raw = model.module if ddp else model
-                    ckpt_path = f"ckpt_step_{i:06d}.pt"
-                    checkpoint = {
-                        'model_state_dict': model_raw.state_dict(),
-                        'model_config': model_raw.config,
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'train_loader_state': train_loader.get_state(),
-                        'val_loader_state': val_loader.get_state(),
-                        'step': i,
-                        'total_tok': total_tok,
-                        'val_loss': loss_val_accum.item(),
-                    }
-                    torch.save(checkpoint, ckpt_path)
-
-        ########################################
-        # HellaSwag Evaluation
-        if (i % hellaswag_every) == 0 or (i == max_steps-1):
-            model.eval()
-            num_total = 0
-            num_correct = 0
-            for j in range(len(hellaswag_examples)):
-                if j % ddp_world_size != ddp_rank:
-                    continue  # only do i-th example
-                example = hellaswag_examples[j]
-                tokens, mask, label = hellaswag_renderer.render_example(example)
-                tokens = tokens.to(device)
-                mask = mask.to(device)
-                with torch.no_grad():
-                    autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == 'cuda' else nullcontext()
-                    with autocast_ctx:
-                        logits, _ = model(tokens)
-                    logits_shifted = logits[:, :-1, :].contiguous()
-                    tokens_shifted = tokens[:, 1:].contiguous()
-                    mask_shifted = mask[:, 1:].contiguous()
-                    B, T_1, V = logits_shifted.shape
-                    losses_shifted = F.cross_entropy(
-                        logits_shifted.view(B*T_1, V),
-                        tokens_shifted.view(B*T_1),
-                        reduction='none'
-                    ).view(B, T_1)
-                    losses_shifted_masked = losses_shifted * mask_shifted
-                    losses_avg = losses_shifted_masked.sum(dim=1) / mask_shifted.sum(dim=1)
-                    model_label = torch.argmin(losses_avg).item()
-                    num_total += 1
-                    if model_label == label:
-                        num_correct += 1
-            if ddp:
-                num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-                num_correct = torch.tensor(num_correct, dtype=torch.long, device=device)
-                torch.distributed.all_reduce(num_total, op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.all_reduce(num_correct, op=torch.distributed.ReduceOp.SUM)
-                num_total = num_total.item()
-                num_correct = num_correct.item()
-            acc_norm = num_correct / num_total
-            if ddp_master:
-                print(f"HellaSwag acc={acc_norm:.4f} correct={num_correct} total={num_total}")
-                with open(logfile, 'a') as f:
-                    f.write(f"hella,{i},{total_tok},{acc_norm:.6f}\n")
-
-
-        ########################################
-        # Generate samples
-        if (i > 0 and (i % gen_samples_every) == 0) or (i == max_steps-1):
-            model.eval()
-
-            sample_rng = torch.Generator(device=device)
-            sample_rng.manual_seed(42 + ddp_rank)
-
-            tokens = tok.encode(prompt)
-            idx = torch.tensor(tokens, dtype=torch.long, device=device)
-            idx = idx.unsqueeze(0).repeat(num_generate, 1)  # B,T
-            idx = generate(model, idx, max_new_tokens, top_k=50, sample_rng=sample_rng) # B,T
-
-            for r in range(ddp_world_size):
-                if ddp_local_rank == r:
-                    for b in range(idx.shape[0]):
-                        gen_text = tok.decode(idx[b].tolist())
-                        print(f"  {r}:{b} > {gen_text}", flush=True)
-                        if ddp_master:
-                            with open(logfile, 'a') as f:
-                                f.write(f"gen,{i},{total_tok},{r},{b},{gen_text}\n")
-                if ddp:
-                    torch.distributed.barrier()
+       
 
         ########################################
         # Training step
@@ -659,56 +397,14 @@ def main():
             torch.cuda.synchronize() # wait for the GPU to finish work
         dt = (time.time() - ts)
         ntok = (micro_batch * block_size * grad_accum* ddp_world_size)
-        total_tok += ntok
         tps = ntok / dt
         if ddp_master:
             pct = (i+1) / max_steps * 100
             cs = train_loader.current_shard
             cp = train_loader.pos
             print(f"{i:4d} ({pct:.2f}%) [{cs};{cp:,}]:, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
-            with open(logfile, 'a') as f:
-                f.write(f"train,{i},{total_tok},{loss_accum.item():.6f},{lr:.6e},{norm:.6f},{dt*1e3:.2f},{tps:.2f}\n")
         
 
-
-    ################################ EQUIVALENCE ###############################
-    # - CUDA_VISIBLE_DEVICES=-1 python train_gpt2.py          <- different
-    # - CUBLAS_WORKSPACE_CONFIG=:4096:8 python train_gpt2.py
-    # - CUBLAS_WORKSPACE_CONFIG=:4096:8 torchrun --standalone --nproc_per_node=2 train_gpt2.py
-    # EQUIVALENCE CHECK: WEIGHT INIT
-    # torch.set_printoptions(precision=10, sci_mode=True, linewidth=200)
-    # model_raw = model.module if ddp else model
-    # for r in range(ddp_world_size):
-    #     if ddp_local_rank == r:
-    #         print(f"--- [rank {ddp_local_rank}] ---", flush=True)
-    #         print("After:")
-    #         print(model_raw.transformer.wte.weight[0, :10].detach().cpu())
-    #         print(model_raw.transformer.h[0].ln_1.weight[:10].detach().cpu())
-    #         print(model_raw.transformer.h[0].attn.c_attn.weight[0, :10].detach().cpu())
-    #         print(model_raw.transformer.h[0].mlp.c_proj.weight[0, :10].detach().cpu())
-    #         print(model_raw.transformer.ln_f.weight[:10].detach().cpu())
-    #         print(model_raw.lm_head.weight[0, :10].detach().cpu())
-    #         print(f"--- ----------------------- ---", flush=True)
-    #     if ddp:
-    #         torch.distributed.barrier()
-    ############################################################################
-
-    # Avg dt: 534.84  Agv tps: 15364.54 - base fp32
-    # Avg dt: 405.77  Agv tps: 20282.09 - use tf32
-    # Avg dt: 303.13  Agv tps: 27361.53 - add autocast to bf16 in fwd/loss calc
-    # Avg dt: 183.24  Agv tps: 44706.74 - add torch.compile()
-    # Avg dt: 139.38  Agv tps: 58773.61 - fused flash attention
-    # Avg dt: 136.42  Agv tps: 60050.99 - switch vocab size to 50304
-    # Avg dt: 134.80  Agv tps: 60773.48 - fused AdamW
-
-    # total_batch_size=524288, block_size=1024, micro_batch=16, ddp_world_size=1, grad_accum=32
-    # 9:, L=7.341308, lr=6.0000e-04 norm=1.8631, dt=8139.71ms, tps=64411.14
-
-    # total_batch_size=524288, block_size=1024, micro_batch=16, ddp_world_size=1, grad_accum=32
-    # 9:, L=7.331692, lr=6.0000e-04 norm=1.9200, dt=7618.34ms, tps=68819.22
-
-    # total_batch_size=524288, block_size=1024, micro_batch=16, ddp_world_size=2, grad_accum=16
-    # 8:, L=7.696642, lr=5.4000e-04 norm=2.3113, dt=4870.42ms, tps=107647.40
     if ddp:
         torch.distributed.destroy_process_group()
     print("Bye")
