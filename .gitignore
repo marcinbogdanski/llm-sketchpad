@@ -1,0 +1,15 @@
+# Python
+*.py[cod]
+__pycache__/
+
+# Environments
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors
+.vscode/
+
+# Other
+bin/
