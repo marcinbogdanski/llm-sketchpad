@@ -1,7 +1,5 @@
 import os
-import math
 import time
-import inspect
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -73,17 +71,19 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+def norm(x):
+    """Param-free replacement for LayerNorm"""
+    return F.rms_norm(x, (x.size(-1),))
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))        # B,T,E pre-norm
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(norm(x))        # B,T,E pre-norm
+        x = x + self.mlp(norm(x))
         return x
 
 
@@ -96,12 +96,8 @@ class GPTModel(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # Weight Sharing
-        self.transformer.wte.weight = self.lm_head.weight
 
         # Init Params
         self.init_weights()
@@ -123,7 +119,46 @@ class GPTModel(nn.Module):
 
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.02)
         torch.nn.init.normal_(self.transformer.wpe.weight, mean=0.0, std=0.02)
-        # NOTE: lm_head is tied to wte, so no need to init it separately
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+
+    def setup_optimizer(self, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.02):
+        """Prepare param groups and setup optimizers. Scale learning rates based on parameter counts"""
+
+        # Separate parameters into groups for different optimizers and learning rates
+        params_matrix = list(self.transformer.h.parameters())
+        params_embedding = list(self.transformer.wte.parameters()) + list(self.transformer.wpe.parameters())
+        params_lm_head = list(self.lm_head.parameters())
+        assert len(list(self.parameters())) == len(params_matrix) + len(params_embedding) + len(params_lm_head)
+
+        # AdamW for dense params
+        adam_groups = [
+            dict(params=params_embedding, lr=embedding_lr, betas=(0.9, 0.95), weight_decay=0.0),
+            dict(params=params_lm_head, lr=unembedding_lr, betas=(0.9, 0.95), weight_decay=0.0)
+        ]
+        adamw_optimizer = torch.optim.AdamW(adam_groups, fused=True)
+
+        # Muon for large matrix params
+        muon_groups = []
+        for shape in sorted({p.shape for p in params_matrix}):
+            group_params = [p for p in params_matrix if p.shape == shape]
+            muon_groups.append({'params': group_params})
+        
+        muon_optimizer = torch.optim.Muon(
+            muon_groups,
+            lr=matrix_lr,
+            momentum=0.95,
+            ns_steps=5,
+            weight_decay=0.0,
+        )
+        
+        # Set initial_lr in param groups for proper LR scaling
+        optimizers = [adamw_optimizer, muon_optimizer]
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+        
+        # [0] is AdamW, [1] is Muon
+        return optimizers
 
     def forward(self, idx, targets):
         B, T = idx.shape
@@ -138,7 +173,7 @@ class GPTModel(nn.Module):
         # Transformer
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = norm(x)
         logits = self.lm_head(x)   # B,T,V <- B,T,E
 
         # Loss
@@ -152,7 +187,6 @@ class GPTModel(nn.Module):
 class DataLoader:
     """Simple data loader for Shakespeare dataset"""
     def __init__(self, data_path, batch_size, block_size, proc_rank, world_size):
-        self.data_path = data_path
         self.batch_size = batch_size
         self.block_size = block_size
         self.proc_rank = proc_rank
@@ -176,23 +210,6 @@ class DataLoader:
 
         return x, y
 
-
-class LRScheduler:
-    def __init__(self, max_lr, min_lr, warmup_steps, max_steps):
-        self.max_lr = max_lr
-        self.min_lr = min_lr
-        self.warmup_steps = warmup_steps
-        self.max_steps = max_steps
-    def get_lr(self, step):
-        if step < self.warmup_steps:
-            return self.max_lr * (step+1) / self.warmup_steps
-        elif self.warmup_steps <= step < self.max_steps:
-            decay_ratio = (step-self.warmup_steps) / (self.max_steps-self.warmup_steps)
-            cf = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-            return self.min_lr + cf * (self.max_lr - self.min_lr)
-        else:
-            return self.min_lr
-
 def main():
     assert torch.cuda.is_available(), "CUDA is required for this training script."
     assert 'RANK' in os.environ, "Must be run with torchrun for DDP."
@@ -204,7 +221,6 @@ def main():
     ddp_master = ddp_rank == 0  # is this a master?
     device = f'cuda:{ddp_local_rank}'
     device_type = 'cuda'
-    assert torch.cuda.is_available()
     torch.cuda.set_device(device)
     torch.distributed.init_process_group(backend='nccl', device_id=ddp_local_rank)  # device_id= to suppress barrier warning
     print(f"{ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
@@ -248,47 +264,43 @@ def main():
     model = torch.compile(model)
     model = DDP(model, device_ids=[ddp_local_rank])
 
-    # LR Scheduler
-    max_lr = 6e-4
-    min_lr = max_lr * 0.1
+    # LR Scheduler params
+    final_lr_frac = 0.1
     warmup_steps = 50
+    warmdown_ratio = 0.4
     max_steps = 500
-    lr_scheduler = LRScheduler(max_lr, min_lr, warmup_steps=warmup_steps, max_steps=max_steps)
+
+    # LR Scheduler function
+    def get_lr(step: int):
+        warmdown_steps = round(warmdown_ratio * max_steps)
+        if step < warmup_steps:
+            return (step+1) / warmup_steps
+        if step <= max_steps - warmdown_steps:
+            return 1.0
+        else:
+            progress = (max_steps - step) / warmdown_steps
+            return (progress * 1.0) + (1.0 - progress) * final_lr_frac
 
     # Optimizer
-    weight_decay = 0.1
-    # All params that require grad
-    param_dict = {pn: p for pn, p in model.named_parameters()}
-    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-    # weight decay 2D params (matmul, embd), skip 1D (biases, layernorms)
-    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': nodecay_params, 'weight_decay': 0.0}
-    ]
-    num_decay = sum(p.numel() for p in decay_params)
-    num_nodecay = sum(p.numel() for p in nodecay_params)
-    if ddp_master:
-        print(f"Decay {len(decay_params)} tensors with {num_decay} params")
-        print(f"Nodecay {len(nodecay_params)} tensors with {num_nodecay} params")
-    # Check if fused adam
-    optimizer = torch.optim.AdamW(
-        optim_groups,
-        lr=max_lr,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        fused=True,
-    )
+    optimizers = model.module.setup_optimizer(embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.02)
 
-    ########################################
-    # Training step
+    # Print group inventory
+    if ddp_master:
+        for opt_name, opt in zip(["AdamW", "Muon"], optimizers):
+            for group in opt.param_groups:
+                num_tensors = len(group['params'])
+                num_el = sum(p.numel() for p in group['params'])
+                shapes = sorted({tuple(p.shape) for p in group['params']})
+                print(f"{opt_name}: {num_tensors:3d} tensors, {num_el/1e6:7.2f}M params, lr={group['initial_lr']:.3g}, shapes={shapes}")
+
+    # Training loop
+    model.train()
     for i in range(max_steps):
-        model.train()
         ts = time.time()
 
         # Zero grad
-        optimizer.zero_grad(set_to_none=True)
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
 
         # Calc gradient
         x, y = train_loader.get_batch()
@@ -298,19 +310,19 @@ def main():
         loss.backward()
         
         # Optimizer step
-        lr = lr_scheduler.get_lr(i)
-        for pg in optimizer.param_groups:
-            pg['lr'] = lr
-        optimizer.step()
+        lrm = get_lr(i)
+        for optimizer in optimizers:
+            for pg in optimizer.param_groups:
+                pg['lr'] = lrm * pg['initial_lr']
+            optimizer.step()
 
         # Logs
-        if device.startswith('cuda'):
-            torch.cuda.synchronize() # wait for the GPU to finish work
+        torch.cuda.synchronize() # wait for the GPU to finish work
         dt = (time.time() - ts)
         ntok = (batch_size * block_size * ddp_world_size)
         tps = ntok / dt
         if ddp_master:
-            print(f"{i:4d}: loss(rank0)={loss.item():.6f}, lr={lr:.4e}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+            print(f"{i:4d}: loss(rank0)={loss.item():.6f}, lr={lrm:.4e}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
         
     torch.distributed.destroy_process_group()
     print("Bye")
