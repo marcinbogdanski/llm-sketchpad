@@ -180,6 +180,7 @@ def main():
     stage_choices = [
         "0_builtin",  # baseline, built-in AdamW + Muon, model wrapped in DDP
         "1_basic",    # Muon implemented in Python, model wrapped in DDP
+        "2_dist",     # ZeRO-2 version of Muon, optimizer handles distributed comms, model not wrapped in DDP
     ]
     parser = argparse.ArgumentParser(description="Train a GPT model with various versions of Muon optimizer.")
     parser.add_argument('--stage', type=str, choices=stage_choices, required=True, help='Which Muon version to use.')
@@ -273,6 +274,7 @@ def main():
     # Training loop
     model.train()
     for i in range(max_steps):
+        torch.cuda.reset_peak_memory_stats()
         ts = time.time()
 
         # Zero grad
@@ -295,11 +297,12 @@ def main():
 
         # Logs
         torch.cuda.synchronize() # wait for the GPU to finish work
+        max_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
         dt = (time.time() - ts)
         ntok = (batch_size * block_size * ddp_world_size)
         tps = ntok / dt
         if ddp_master:
-            print(f"{i:4d}: loss(rank0)={loss.item():.6f}, lr={lrm:.4e}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+            print(f"{i:4d}: loss(rank0)={loss.item():.6f}, lr={lrm:.4e}, dt={dt*1e3:.2f}ms, tps={tps:.2f}, max_mem={max_mem:.2f}GB")
         
     torch.distributed.destroy_process_group()
     print("Bye")
