@@ -1,5 +1,7 @@
 import os
 import time
+import importlib
+import argparse
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -121,45 +123,6 @@ class GPTModel(nn.Module):
         torch.nn.init.normal_(self.transformer.wpe.weight, mean=0.0, std=0.02)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
-    def setup_optimizer(self, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.02):
-        """Prepare param groups and setup optimizers. Scale learning rates based on parameter counts"""
-
-        # Separate parameters into groups for different optimizers and learning rates
-        params_matrix = list(self.transformer.h.parameters())
-        params_embedding = list(self.transformer.wte.parameters()) + list(self.transformer.wpe.parameters())
-        params_lm_head = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(params_matrix) + len(params_embedding) + len(params_lm_head)
-
-        # AdamW for dense params
-        adam_groups = [
-            dict(params=params_embedding, lr=embedding_lr, betas=(0.9, 0.95), weight_decay=0.0),
-            dict(params=params_lm_head, lr=unembedding_lr, betas=(0.9, 0.95), weight_decay=0.0)
-        ]
-        adamw_optimizer = torch.optim.AdamW(adam_groups, fused=True)
-
-        # Muon for large matrix params
-        muon_groups = []
-        for shape in sorted({p.shape for p in params_matrix}):
-            group_params = [p for p in params_matrix if p.shape == shape]
-            muon_groups.append({'params': group_params})
-        
-        muon_optimizer = torch.optim.Muon(
-            muon_groups,
-            lr=matrix_lr,
-            momentum=0.95,
-            ns_steps=5,
-            weight_decay=0.0,
-        )
-        
-        # Set initial_lr in param groups for proper LR scaling
-        optimizers = [adamw_optimizer, muon_optimizer]
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
-        
-        # [0] is AdamW, [1] is Muon
-        return optimizers
-
     def forward(self, idx, targets):
         B, T = idx.shape
         assert T <= self.config.block_size
@@ -212,7 +175,14 @@ class DataLoader:
 
 def main():
     assert torch.cuda.is_available(), "CUDA is required for this training script."
-    assert 'RANK' in os.environ, "Must be run with torchrun for DDP."
+    assert 'RANK' in os.environ, "Must be run with torchrun, --nproc_per_node=1 falls back to single-GPU training"
+
+    stage_choices = [
+        "0_builtin",  # baseline, built-in AdamW + Muon, model wrapped in DDP
+    ]
+    parser = argparse.ArgumentParser(description="Train a GPT model with various versions of Muon optimizer.")
+    parser.add_argument('--stage', type=str, choices=stage_choices, required=True, help='Which Muon version to use.')
+    args = parser.parse_args()
 
     # DDP Init
     ddp_rank = int(os.environ['RANK'])
@@ -262,7 +232,6 @@ def main():
     ))
     model.to(device)
     model = torch.compile(model)
-    model = DDP(model, device_ids=[ddp_local_rank])
 
     # LR Scheduler params
     final_lr_frac = 0.1
@@ -282,7 +251,14 @@ def main():
             return (progress * 1.0) + (1.0 - progress) * final_lr_frac
 
     # Optimizer
-    optimizers = model.module.setup_optimizer(embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.02)
+    # Passing compiled model to optimizer is ok because of __getattr__ forwarding
+    optim_module = importlib.import_module(f"optim_{args.stage}")
+    optimizers = optim_module.setup_optimizers(model, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.02)
+
+    # Builtin and single-GPU optimizer version require DDP wrapping
+    # DDP wrap after optimizer setup is ok: DDP syncs params in place and tensor references are preserved
+    if not optim_module.OPTIMIZERS_OWN_COMMS:
+        model = DDP(model, device_ids=[ddp_local_rank])
 
     # Print group inventory
     if ddp_master:
