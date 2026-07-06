@@ -3,20 +3,41 @@ import torch
 OPTIMIZERS_OWN_COMMS = True  # Muon handles distributed comms, model should not be wrapped in DDP
 
 
-class AdamWDist(torch.optim.AdamW):
-    """Minimal modification to AdamW to handle distributed comms, now that DDP is disabled.
+@torch.compile(dynamic=False, fullgraph=True)
+def fused_adamw_step(
+    params,
+    grad,
+    exp_avg,
+    exp_avg_sq,
+    step,
+    lr,
+    beta1,
+    beta2,
+    eps,
+    wd,
+):
+    # Weight Decay
+    # p = p - lr * weight_decay * p
+    params.mul_(1 - lr * wd)
+
+    # Update v
+    # v = B1 * v + (1-B1) * g
+    exp_avg.lerp_(grad, 1-beta1)
+
+    # Update s
+    # s = B2 * s + (1-B2) * g**2
+    exp_avg_sq.lerp_(grad.square(), 1-beta2)
     
-    Every rank averages gradients before the optimizer step, then applies same optimization
-    redundantly on all ranks. Params stay in sync because all ranks started with
-    the same model (same seed) and see the same gradients (averaged across ranks).
-    """
-    
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            for p in group['params']:
-                torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
-        super().step()
+    # Correction
+    # Somewhat convoluted way to do:
+    # v_corrected = v / (1-B1**t)
+    # s_corrected = s / (1-B2**t)
+    # p = p - lr * v_corrected / (sqrt(s_corrected)+eps)
+    bias1 = 1-beta1**step
+    bias2 = 1-beta2**step
+    denom = (exp_avg_sq / bias2).sqrt().add_(eps)
+    update = exp_avg.div(denom).mul_(lr / bias1)
+    params.add_(update, alpha=-1.0)
 
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -58,6 +79,70 @@ def fused_muon_step(
     params.sub_(lr * update)
 
 
+class AdamWFused(torch.optim.Optimizer):
+    """ZeRO-2 version of AdamW optimizer"""
+    def __init__(self, params, lr=0.01, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+    
+    @torch.no_grad()
+    def step(self):
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+
+        for group in self.param_groups:
+            for params in group['params']:
+                if params.grad is None:
+                    continue
+                # Lazy Init
+                assert params.size(0) % world_size == 0
+                slice_width = params.size(0) // world_size
+                slice_start = rank * slice_width
+                slice_end = slice_start + slice_width
+
+                if params not in self.state:
+                    self.state[params] = {
+                        'step': 0,
+                        'exp_avg': torch.zeros_like(params[:slice_width]),
+                        'exp_avg_sq': torch.zeros_like(params[:slice_width]),
+                    }
+                self.state[params]['step'] += 1
+
+                # Sync point 1
+                grad_slice = torch.empty_like(params.grad[:slice_width])
+                torch.distributed.reduce_scatter_tensor(grad_slice, params.grad, op=torch.distributed.ReduceOp.AVG)
+                params_slice = params[slice_start:slice_end]
+
+                # NOTE: We will break into two loops here later, when implementing async comms
+
+                exp_avg = self.state[params]['exp_avg']
+                exp_avg_sq = self.state[params]['exp_avg_sq']
+
+                step = torch.tensor(self.state[params]['step'], device='cpu', dtype=torch.float32)
+                lr = torch.tensor(group['lr'], device='cpu', dtype=torch.float32)
+                beta1 = torch.tensor(group['betas'][0], device='cpu', dtype=torch.float32)
+                beta2 = torch.tensor(group['betas'][1], device='cpu', dtype=torch.float32)
+                eps = torch.tensor(group['eps'], device='cpu', dtype=torch.float32)
+                wd = torch.tensor(group['weight_decay'], device='cpu', dtype=torch.float32)
+
+                fused_adamw_step(
+                    params=params_slice,
+                    grad=grad_slice,
+                    exp_avg=exp_avg,
+                    exp_avg_sq=exp_avg_sq,
+                    step=step,
+                    lr=lr,
+                    beta1=beta1,
+                    beta2=beta2,
+                    eps=eps,
+                    wd=wd,
+                )
+
+                # Sync point 2
+                torch.distributed.all_gather_into_tensor(params, params_slice)                    
+
+
+
 class MuonFused(torch.optim.Optimizer):
     """ZeRO-2 inspired version of Muon optimizer
     
@@ -79,7 +164,6 @@ class MuonFused(torch.optim.Optimizer):
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
 
-        # Sync point 1
         # This will reduce scatter grads, such that each rank gets full averaged grad for owned param
         for group in self.param_groups:
             p = group['params'][0]  # shape, dtype, device
@@ -95,6 +179,7 @@ class MuonFused(torch.optim.Optimizer):
             num_params_per_rank = padded_num_params // world_size
             stacked_grads = torch.empty(num_params_per_rank, *p.shape, dtype=p.dtype, device=p.device)
 
+            # Sync point 1
             torch.distributed.reduce_scatter_tensor(
                 output=stacked_grads,
                 input=stacked_all_grads,
@@ -158,7 +243,7 @@ def setup_optimizers(model, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.0
         dict(params=params_embedding, lr=embedding_lr, betas=(0.9, 0.95), weight_decay=0.0),
         dict(params=params_lm_head, lr=unembedding_lr, betas=(0.9, 0.95), weight_decay=0.0)
     ]
-    adamw_optimizer = AdamWDist(adam_groups, fused=True)
+    adamw_optimizer = AdamWFused(adam_groups)
 
     # Muon for large matrix params
     muon_groups = []
