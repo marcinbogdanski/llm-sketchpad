@@ -3,20 +3,71 @@ import torch
 OPTIMIZERS_OWN_COMMS = True  # Muon handles distributed comms, model should not be wrapped in DDP
 
 
-class AdamWDist(torch.optim.AdamW):
-    """Minimal modification to AdamW to handle distributed comms, now that DDP is disabled.
-    
-    Every rank averages gradients before the optimizer step, then applies same optimization
-    redundantly on all ranks. Params stay in sync because all ranks started with
-    the same model (same seed) and see the same gradients (averaged across ranks).
-    """
+class AdamWDist(torch.optim.Optimizer):
+    """ZeRO-2 version of AdamW optimizer"""
+    def __init__(self, params, lr=0.01, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
     
     @torch.no_grad()
     def step(self):
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+
         for group in self.param_groups:
             for p in group['params']:
-                torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
-        super().step()
+                if p.grad is None:
+                    continue
+                # Lazy Init
+                assert p.size(0) % world_size == 0, f"Param shape {p.shape} not divisible by world size"
+                slice_width = p.size(0) // world_size
+                slice_start = rank * slice_width
+                slice_end = slice_start + slice_width
+
+                if p not in self.state:
+                    self.state[p] = {
+                        'step': torch.tensor(0, dtype=torch.int64, device=p.device),
+                        'exp_avg': torch.zeros_like(p[:slice_width]),
+                        'exp_avg_sq': torch.zeros_like(p[:slice_width]),
+                    }
+                self.state[p]['step'] += 1
+
+                # Weight Decay
+                if group['weight_decay'] != 0.0:
+                    # AdamW
+                    # p = p - lr * weight_decay * p
+                    p[slice_start:slice_end].mul_(1 - group['lr'] * group['weight_decay'])
+
+                # Sync point 1
+                grad_slice = torch.empty_like(p.grad[:slice_width])
+                torch.distributed.reduce_scatter_tensor(grad_slice, p.grad, op=torch.distributed.ReduceOp.AVG)
+
+                # Update v
+                # v = B1 * v + (1-B1) * g
+                v = self.state[p]['exp_avg']
+                v.mul_(group['betas'][0]).add_(grad_slice, alpha=1-group['betas'][0])
+
+                # Update s
+                # s = B2 * s + (1-B2) * g**2
+                s = self.state[p]['exp_avg_sq']
+                s.mul_(group['betas'][1])
+                s.addcmul_(grad_slice, grad_slice, value=1-group['betas'][1])
+
+                # Correction
+                # Somewhat convoluted way to do:
+                # v_corrected = v / (1-B1**t)
+                # s_corrected = s / (1-B2**t)
+                # p = p - lr * v_corrected / (sqrt(s_corrected)+eps)
+                t = self.state[p]['step']
+                bias1 = 1-group['betas'][0]**t
+                bias2 = 1-group['betas'][1]**t
+                denom = (s / bias2).sqrt().add_(group['eps'])
+                update = v.div(denom).mul_(-group['lr'] / bias1)
+                p_slice = p[slice_start:slice_end] + update
+
+                # Sync point 2
+                torch.distributed.all_gather_into_tensor(p, p_slice)
+
 
 
 
@@ -147,7 +198,7 @@ def setup_optimizers(model, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.0
         dict(params=params_embedding, lr=embedding_lr, betas=(0.9, 0.95), weight_decay=0.0),
         dict(params=params_lm_head, lr=unembedding_lr, betas=(0.9, 0.95), weight_decay=0.0)
     ]
-    adamw_optimizer = AdamWDist(adam_groups, fused=True)
+    adamw_optimizer = AdamWDist(adam_groups)
 
     # Muon for large matrix params
     muon_groups = []
