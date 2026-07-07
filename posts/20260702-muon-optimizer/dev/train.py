@@ -179,9 +179,10 @@ def main():
 
     stage_choices = [
         "0_builtin",  # baseline, built-in AdamW + Muon, model wrapped in DDP
-        "1_basic",    # Muon implemented in Python, model wrapped in DDP
-        "2_dist",     # ZeRO-2 version of Muon, optimizer handles distributed comms, model not wrapped in DDP
-        "3_fused",    # Implement fused kernel in Muon
+        "1_basic",    # AdamW/Muon implemented in Python, model wrapped in DDP
+        "2_dist",     # ZeRO-2 version of AdamW/Muon, optimizers handle distributed comms, model not wrapped in DDP
+        "3_fused",    # Implement fused kernel in AdamW/Muon
+        "4_async",    # Implement async comms in AdamW/Muon
     ]
     parser = argparse.ArgumentParser(description="Train a GPT model with various versions of Muon optimizer.")
     parser.add_argument('--stage', type=str, choices=stage_choices, required=True, help='Which Muon version to use.')
