@@ -183,6 +183,7 @@ def main():
         "2_dist",     # ZeRO-2 version of AdamW/Muon, optimizers handle distributed comms, model not wrapped in DDP
         "3_fused",    # Implement fused kernel in AdamW/Muon
         "4_async",    # Implement async comms in AdamW/Muon
+        "5_nanochat"  # Nanochat-compatible version, Polar Express, NorMuon, Cautions Weight Decay
     ]
     parser = argparse.ArgumentParser(description="Train a GPT model with various versions of Muon optimizer.")
     parser.add_argument('--stage', type=str, choices=stage_choices, required=True, help='Which Muon version to use.')
@@ -241,7 +242,7 @@ def main():
     final_lr_frac = 0.1
     warmup_steps = 50
     warmdown_ratio = 0.4
-    max_steps = 500
+    max_steps = 10 # 500
 
     # LR Scheduler function
     def get_lr(step: int):
