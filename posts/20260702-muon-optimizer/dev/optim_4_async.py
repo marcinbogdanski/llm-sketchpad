@@ -281,7 +281,7 @@ class MuonAsync(torch.optim.Optimizer):
 
 
 
-def setup_optimizers(model, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.02):
+def setup_optimizers(model, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.02, weight_decay=0.0):
     """Prepare param groups and setup optimizers. Scale learning rates based on parameter counts"""
     assert isinstance(model, torch.nn.Module)
 
@@ -309,7 +309,7 @@ def setup_optimizers(model, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.0
         lr=matrix_lr,
         momentum=0.95,
         ns_steps=5,
-        weight_decay=0.0,
+        weight_decay=weight_decay,
     )
     
     # Set initial_lr in param groups for proper LR scaling

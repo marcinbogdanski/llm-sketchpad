@@ -185,8 +185,15 @@ def main():
         "4_async",    # Implement async comms in AdamW/Muon
         "5_nanochat"  # Nanochat-compatible version, Polar Express, NorMuon, Cautions Weight Decay
     ]
-    parser = argparse.ArgumentParser(description="Train a GPT model with various versions of Muon optimizer.")
-    parser.add_argument('--stage', type=str, choices=stage_choices, required=True, help='Which Muon version to use.')
+    parser = argparse.ArgumentParser(description="Train a GPT model with various versions of AdamW/Muon optimizer.")
+    parser.add_argument('--depth', type=int, default=12, help='Number of transformer layers. Drives n_head and n_embd.')
+    parser.add_argument('--stage', type=str, choices=stage_choices, required=True, help='Which AdamW/Muon version to use.')
+    parser.add_argument('--num-iterations', type=int, default=500, help='Maximum number of training steps.')
+    parser.add_argument("--embedding-lr", type=float, default=0.1, help="learning rate for embedding parameters (AdamW)")
+    parser.add_argument("--unembedding-lr", type=float, default=0.01, help="learning rate for unembedding parameters (AdamW)")
+    parser.add_argument("--matrix-lr", type=float, default=0.02, help="Learning rate for matrix parameters (Muon)")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Cautious weight decay for the Muon optimizer (for weights)")
+
     args = parser.parse_args()
 
     # DDP Init
@@ -226,14 +233,18 @@ def main():
         world_size=ddp_world_size,
     )
 
+    n_layer = args.depth
+    n_head = args.depth    # head size stays at 64 (n_embd/n_head = 64)
+    n_embd = 64 * n_layer
+    
     # Model
     # NOTE: because vocab_size is expanded model may in theory generate invalid tokens
     model = GPTModel(GPTConfig(
         block_size=1024,     # max context length, max len feed into the model,
         vocab_size=50304,    # 50304 is 'nicer', original was 50257
-        n_layer=12,
-        n_head=12,           # head size 768/12=64,
-        n_embd=768,          # size of embeddings, i.e. 'first layer',
+        n_layer=n_layer,
+        n_head=n_head,           # head size n_embd/n_head = 64,
+        n_embd=n_embd,          # size of embeddings, i.e. 'first layer',
     ))
     model.to(device)
     model = torch.compile(model)
@@ -242,7 +253,7 @@ def main():
     final_lr_frac = 0.1
     warmup_steps = 50
     warmdown_ratio = 0.4
-    max_steps = 10 # 500
+    max_steps = args.num_iterations
 
     # LR Scheduler function
     def get_lr(step: int):
@@ -256,9 +267,18 @@ def main():
             return (progress * 1.0) + (1.0 - progress) * final_lr_frac
 
     # Optimizer
+    # AdamW LRs below were tuned at depth=12, n_embd=768
+    # This rescale is a muP-flavored heuristic, similar to nanochat. Real HP transfer is out of scope here.
+    dmodel_lr_scale = (n_embd/768) ** -0.5
     # Passing compiled model to optimizer is ok because of __getattr__ forwarding
     optim_module = importlib.import_module(f"optim_{args.stage}")
-    optimizers = optim_module.setup_optimizers(model, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.02)
+    optimizers = optim_module.setup_optimizers(
+        model,
+        embedding_lr=args.embedding_lr * dmodel_lr_scale,
+        unembedding_lr=args.unembedding_lr * dmodel_lr_scale,
+        matrix_lr=args.matrix_lr,
+        weight_decay=args.weight_decay
+    )
 
     # Builtin and single-GPU optimizer version require DDP wrapping
     # DDP wrap after optimizer setup is ok: DDP syncs params in place and tensor references are preserved
