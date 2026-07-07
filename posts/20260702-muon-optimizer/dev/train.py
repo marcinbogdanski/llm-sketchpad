@@ -193,6 +193,7 @@ def main():
     parser.add_argument("--unembedding-lr", type=float, default=0.01, help="learning rate for unembedding parameters (AdamW)")
     parser.add_argument("--matrix-lr", type=float, default=0.02, help="Learning rate for matrix parameters (Muon)")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Cautious weight decay for the Muon optimizer (for weights)")
+    parser.add_argument("--profile", action="store_true", help="Trace training step 10 with torch.profiler, export chrome trace per rank (open in ui.perfetto.dev)")
 
     args = parser.parse_args()
 
@@ -294,6 +295,20 @@ def main():
                 shapes = sorted({tuple(p.shape) for p in group['params']})
                 print(f"{opt_name}: {num_tensors:3d} tensors, {num_el/1e6:7.2f}M params, lr={group['initial_lr']:.3g}, shapes={shapes}")
 
+    # Profiler setup
+    profiler = None
+    if args.profile:
+        assert max_steps > 10, "Need more than 10 steps to profile step 10"
+        def export_trace(prof):
+            trace_path = f"trace_rank{ddp_rank}.json.gz"
+            prof.export_chrome_trace(trace_path)
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=9, warmup=1, active=1),
+            on_trace_ready=export_trace,
+        )
+        profiler.start()
+
     # Training loop
     model.train()
     for i in range(max_steps):
@@ -307,16 +322,20 @@ def main():
         # Calc gradient
         x, y = train_loader.get_batch()
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            loss = model(x, y)
-        loss.backward()
+        with torch.profiler.record_function("fwd_bwd"):
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                loss = model(x, y)
+            loss.backward()
         
         # Optimizer step
         lrm = get_lr(i)
         for optimizer in optimizers:
             for pg in optimizer.param_groups:
                 pg['lr'] = lrm * pg['initial_lr']
-            optimizer.step()
+        with torch.profiler.record_function("adamw_step"):
+            optimizers[0].step()
+        with torch.profiler.record_function("muon_step"):
+            optimizers[1].step()
 
         # Logs
         torch.cuda.synchronize() # wait for the GPU to finish work
@@ -326,6 +345,13 @@ def main():
         tps = ntok / dt
         if ddp_master:
             print(f"{i:4d}: loss(rank0)={loss.item():.6f}, lr={lrm:.4e}, dt={dt*1e3:.2f}ms, tps={tps:.2f}, max_mem={max_mem:.2f}GB")
+        
+        if profiler is not None:
+            profiler.step()
+    
+    if profiler is not None:
+        profiler.stop()
+        print(f"Rank {ddp_rank} trace exported, open in ui.perfetto.dev")
         
     torch.distributed.destroy_process_group()
     print("Bye")
