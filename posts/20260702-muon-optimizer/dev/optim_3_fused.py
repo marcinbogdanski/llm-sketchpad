@@ -228,7 +228,7 @@ class MuonFused(torch.optim.Optimizer):
 
 
 
-def setup_optimizers(model, embedding_lr=0.1, unembedding_lr=0.01, matrix_lr=0.02, weight_decay=0.0):
+def setup_optimizers(model, embedding_lr=0.3, unembedding_lr=0.003, matrix_lr=0.02, weight_decay=0.0):
     """Prepare param groups and setup optimizers. Scale learning rates based on parameter counts"""
     assert isinstance(model, torch.nn.Module)
 
