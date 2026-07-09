@@ -189,6 +189,7 @@ def main():
     parser.add_argument('--depth', type=int, default=12, help='Number of transformer layers. Drives n_head and n_embd.')
     parser.add_argument('--stage', type=str, choices=stage_choices, required=True, help='Which AdamW/Muon version to use.')
     parser.add_argument('--num-iterations', type=int, default=500, help='Maximum number of training steps.')
+    parser.add_argument('--device-batch-size', type=int, default=16, help='Batch size per device.')
     parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (AdamW)")
     parser.add_argument("--unembedding-lr", type=float, default=0.003, help="learning rate for unembedding parameters (AdamW)")
     parser.add_argument("--matrix-lr", type=float, default=0.02, help="Learning rate for matrix parameters (Muon)")
@@ -208,6 +209,10 @@ def main():
     torch.distributed.init_process_group(backend='nccl', device_id=ddp_local_rank)  # device_id= to suppress barrier warning
     print(f"{ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
 
+    # Print args
+    if ddp_master:
+        print(f"Args: {vars(args)}")
+
     # Enable TF32 for matmul
     torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
 
@@ -218,7 +223,7 @@ def main():
     torch.cuda.manual_seed_all(42)
 
     # Batching
-    batch_size = 16             # what fits in GPU
+    batch_size = args.device_batch_size             # what fits in GPU
     block_size = 1024
     
     if ddp_master:
@@ -300,11 +305,11 @@ def main():
     if args.profile:
         assert max_steps > 10, "Need more than 10 steps to profile step 10"
         def export_trace(prof):
-            trace_path = f"trace_rank{ddp_rank}.json.gz"
+            trace_path = f"trace_stage_{args.stage}_rank{ddp_rank}.json.gz"
             prof.export_chrome_trace(trace_path)
         profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=9, warmup=1, active=1),
+            schedule=torch.profiler.schedule(wait=9, warmup=1, active=1, repeat=1),
             on_trace_ready=export_trace,
         )
         profiler.start()
