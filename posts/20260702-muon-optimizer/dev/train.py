@@ -2,13 +2,15 @@ import os
 import time
 import importlib
 import argparse
+from urllib.request import urlopen
 from dataclasses import dataclass
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import tiktoken
-from pathlib import Path
+import pyarrow.parquet as pq
 
 @dataclass
 class GPTConfig:
@@ -148,19 +150,54 @@ class GPTModel(nn.Module):
 
 
 class DataLoader:
-    """Simple data loader for Shakespeare dataset"""
-    def __init__(self, data_path, batch_size, block_size, proc_rank, world_size):
+    """Simple data loader for first shard of ClimbMix dataset
+    
+    On first run, rank 0 downloads the first shard, tokenizes it and saves as .npy file.
+    For testing we need roughly micro_batch=64, world_size=8, block_size=1024.
+    That is 524,288 tokens per step on 8xH100 node. More than enough for perf testing.
+    """
+    def __init__(self, batch_size, block_size, proc_rank, world_size):
         self.batch_size = batch_size
         self.block_size = block_size
         self.proc_rank = proc_rank
         self.world_size = world_size
         self.pos = self.batch_size * self.block_size * self.proc_rank
 
-        with open(data_path, 'r') as f:
-            text = f.read()
-        tokenizer = tiktoken.get_encoding("gpt2")
-        tokens = tokenizer.encode(text)
-        self.tokens = torch.tensor(tokens)
+        tokens_filename = "shard_00000.npy"
+        parquet_filename = "shard_00000.parquet"  # temp: download, process, delete
+        if proc_rank == 0 and not os.path.exists(tokens_filename):
+            # Download the first shard
+            base_url = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main/"
+            remote_url = base_url + parquet_filename
+            print(f"Rank {proc_rank} downloading {remote_url}")
+            with urlopen(remote_url, timeout=30) as r, open(parquet_filename, "wb") as f:
+                f.write(r.read())
+            print(f"Rank {proc_rank} downloaded {parquet_filename}")
+
+            # Read the text from the parquet file
+            documents = []  # list of strings
+            pf = pq.ParquetFile(parquet_filename)
+            for rg_index in range(pf.num_row_groups):
+                rg = pf.read_row_group(rg_index)
+                rg_documents = rg.column('text').to_pylist()
+                documents.extend(rg_documents)
+
+            # Tokenize and save as .npy ready for training            
+            tokenizer = tiktoken.get_encoding("gpt2")
+            doc_tokens = tokenizer.encode_ordinary_batch(documents, num_threads=16)
+            tokens = []
+            for dt in doc_tokens:
+                tokens.extend([tokenizer.eot_token] + dt)  # prepend EOT to each document
+            np.save("shard_00000.npy", np.array(tokens, dtype=np.uint16))  # gpt2 vocab fits in uint16
+            os.remove(parquet_filename)
+            print(f"Rank {proc_rank} loaded {len(documents)} docs, {len(tokens)} tokens, saved to {tokens_filename}")
+
+        # Other ranks wait for rank 0 to finish downloading
+        torch.distributed.barrier()
+
+        self.tokens = torch.from_numpy(np.load(tokens_filename)).to(torch.int64)
+
+
 
     def get_batch(self):
         buff = self.tokens[self.pos:self.pos+self.batch_size*self.block_size+1]
@@ -230,9 +267,7 @@ def main():
         print(f"{block_size=}, {batch_size=}, {ddp_world_size=}")
 
     # Data Loader
-    data_path = Path(__file__).resolve().parent.parent.parent.parent / "data" / "tinyshakespeare.txt"
     train_loader = DataLoader(
-        data_path=data_path,
         batch_size=batch_size,
         block_size=block_size,
         proc_rank=ddp_rank,

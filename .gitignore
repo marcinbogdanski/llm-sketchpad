@@ -13,3 +13,7 @@ __pycache__/
 
 # Other
 bin/
+
+# Data shards (auto-downloaded)
+*.npy
+*.parquet
