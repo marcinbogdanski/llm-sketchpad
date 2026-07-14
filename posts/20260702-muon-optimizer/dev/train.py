@@ -244,10 +244,10 @@ def main():
     device_type = 'cuda'
     torch.cuda.set_device(device)
     torch.distributed.init_process_group(backend='nccl', device_id=ddp_local_rank)  # device_id= to suppress barrier warning
-    print(f"{ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
 
     # Print args
     if ddp_master:
+        print(f"DDP: {ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
         print(f"Args: {vars(args)}")
 
     # Enable TF32 for matmul
@@ -391,10 +391,12 @@ def main():
     
     if profiler is not None:
         profiler.stop()
-        print(f"Rank {ddp_rank} trace exported, open in ui.perfetto.dev")
+        if ddp_master:
+            print(f"Rank {ddp_rank} trace exported, open in ui.perfetto.dev")
         
     torch.distributed.destroy_process_group()
-    print("Bye")
+    if ddp_master:
+        print("Bye")
 
 
 if __name__ == "__main__":
