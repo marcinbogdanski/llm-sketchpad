@@ -1,5 +1,29 @@
 
 
+## 2026.07.14 Rerun Hyperparameter Sweep
+
+Rerun hyperparam sweep, changes since last run:
+- added `RESULTS:` lines for easy parsing
+- we are now on 4x3090 vs 2x up to this point
+- dataset changed from tiny Shakespeare to first shard of ClimbMix
+
+| label | matrix_lr | embedding_lr | unembedding_lr | weight_decay | final loss (mean last 10) |
+|---|---:|---:|---:|---:|---:|
+|              default |   0.02 |    0.3 |  0.003 |    0.0 | 4.3928 |
+|      matrix_lr=0.005 |  0.005 |    0.3 |  0.003 |    0.0 | 4.9026 |
+|       matrix_lr=0.01 |   0.01 |    0.3 |  0.003 |    0.0 | 4.5555 |
+|       matrix_lr=0.04 |   0.04 |    0.3 |  0.003 |    0.0 | 4.7181 |
+|    embedding_lr=0.03 |   0.02 |   0.03 |  0.003 |    0.0 | 4.4582 |
+|     embedding_lr=0.6 |   0.02 |    0.6 |  0.003 |    0.0 | 4.4507 |
+| unembedding_lr=0.001 |   0.02 |    0.3 |  0.001 |    0.0 | 4.5066 |
+|  unembedding_lr=0.03 |   0.02 |    0.3 |   0.03 |    0.0 | 4.5810 |
+|     weight_decay=0.1 |   0.02 |    0.3 |  0.003 |    0.1 | 4.3559 |
+
+Current defaults are confirmed on every LR axis. Interestingly embedding LR barely matters.
+
+On weight decay: changing WD 0.0->0.1 seems to slightly improve loss, at least on stage `5_nanochat` which is using Cautious Weight Decay (stages 0-4 use plain WD). `nanochat` tested this extensively and we got a nice small sanity check. I'm enabling WD=0.1 as the default for all stages. Strictly, the sweep only supports this for stage `5_nanochat`, and for stages 0-4 value remains untested. I accept it here because stages 0-4 are meant to be a reference.
+
+
 ## 2026.07.13 Logging Silliness
 
 Generating summary tables is far more complex because of few issues with the logs:
