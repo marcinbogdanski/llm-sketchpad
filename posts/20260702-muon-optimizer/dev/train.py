@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import importlib
 import argparse
 from urllib.request import urlopen
@@ -242,6 +243,7 @@ def main():
     ddp_master = ddp_rank == 0  # is this a master?
     device = f'cuda:{ddp_local_rank}'
     device_type = 'cuda'
+    ddp_spec = {'rank': ddp_rank, 'local_rank': ddp_local_rank, 'world_size': ddp_world_size, 'master': ddp_master, 'device': device}
     torch.cuda.set_device(device)
     torch.distributed.init_process_group(backend='nccl', device_id=ddp_local_rank)  # device_id= to suppress barrier warning
 
@@ -351,6 +353,7 @@ def main():
 
     # Training loop
     model.train()
+    metrics = {'loss': [], 'dt': [], 'tps': [], 'max_mem': []}
     for i in range(max_steps):
         torch.cuda.reset_peak_memory_stats()
         ts = time.time()
@@ -384,10 +387,32 @@ def main():
         ntok = (batch_size * block_size * ddp_world_size)
         tps = ntok / dt
         if ddp_master:
-            print(f"{i:4d}: loss(rank0)={loss.item():.6f}, lr={lrm:.4e}, dt={dt*1e3:.2f}ms, tps={tps:.2f}, max_mem={max_mem:.2f}GB")
+            val_loss = loss.item()
+            metrics['loss'].append(val_loss)
+            metrics['dt'].append(dt)
+            metrics['tps'].append(tps)
+            metrics['max_mem'].append(max_mem)
+            print(f"{i:4d}: loss(rank0)={val_loss:.6f}, lr={lrm:.4e}, dt={dt*1e3:.2f}ms, tps={tps:.2f}, max_mem={max_mem:.2f}GB")
         
         if profiler is not None:
             profiler.step()
+
+    if ddp_master:
+        dt_median = float(np.median(metrics['dt'][2:]))  # 0 - compile, 1 - allocator warmup
+        tps_median = float(np.median(metrics['tps'][2:]))
+        max_mem_max = float(max(metrics['max_mem']))
+        loss_mean = float(np.mean(metrics['loss'][-10:]))
+        results_dict = {
+            "args": vars(args),
+            "ddp_spec": ddp_spec,
+            "results": {
+                "dt_median_ms": dt_median*1e3,
+                "tps_median": tps_median,
+                "max_mem_GB": max_mem_max,
+                "loss_mean_last10": loss_mean
+            }
+        }
+        print(f"RESULTS: {json.dumps(results_dict)}")
     
     if profiler is not None:
         profiler.stop()

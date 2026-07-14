@@ -1,5 +1,14 @@
 
 
+## 2026.07.13 Logging Silliness
+
+Generating summary tables is far more complex because of few issues with the logs:
+
+- multiple ranks printing at once cause logs to be scrambled, e.g. `Args: {..., 'profile': False}ddp_rank=1, ddp_local_rank=1, ...`
+- log params are on `Args: {..}` line, results need to be parsed from per-step lines, some param are in custom `=== wscale stage=0_builtin nproc=1` lines
+
+Because of that script to parse logs is unnecessarily complex. Adding single `RESULTS: ` line including params, ddp setup, and ready to use results fixes it. Can't believe I didn't do it right away after same pain when reproducing `nanochat`
+
 ## 2026.07.10 8xH200 Runs
 
 Initial parsing of the results of d26 run on 8xH200, batch 32x1024 per GPU
