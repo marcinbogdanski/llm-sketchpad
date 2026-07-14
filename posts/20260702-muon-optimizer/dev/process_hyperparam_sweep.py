@@ -1,12 +1,12 @@
+#!/usr/bin/env python3
 """Process results of run_hyperparam_sweep.sh and print markdown table.
 
 Run sweep:
 NPROC=4 ./run_hyperparam_sweep.sh 2>&1 | tee logs/hyperparam_sweep.log
 
 Process results:
-uv run python3 process_sweep_results.py logs/hyperparam_sweep.log
+uv run python3 process_hyperparam_sweep.py logs/hyperparam_sweep.log
 """
-#!/usr/bin/env python3
 import sys
 import json
 
