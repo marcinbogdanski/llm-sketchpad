@@ -249,7 +249,8 @@ def main():
 
     # Print args
     if ddp_master:
-        print(f"DDP: {ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
+        print(f"DDP: {ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, "
+              f"{device=}, gpu={torch.cuda.get_device_name(0)}, torch={torch.__version__}")
         print(f"Args: {vars(args)}")
 
     # Enable TF32 for matmul
