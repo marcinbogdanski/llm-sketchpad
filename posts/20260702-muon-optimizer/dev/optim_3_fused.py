@@ -47,12 +47,8 @@ def fused_muon_step(
     momentum_buffer,
     momentum,
     lr,
-    wd,
     steps=5
 ):
-    # Decoupled Weight Decay
-    params.mul_(1 - lr * wd)
-
     # Update v: v = B1 * v + (1-B) * g
     v = momentum_buffer
     v.lerp_(grad, 1 - momentum)
@@ -147,15 +143,14 @@ class MuonFused(torch.optim.Optimizer):
     """ZeRO-2 inspired version of Muon optimizer
     
     Algorithm:
-        p = p - lr * wd * p              # decoupled weight decay
         v = B * v + (1-B) * g            # momentum 
         vv = B * v + (1-B) * g           # optional, Nesterov look-ahead (just lerp again)
         U = newton_schulz(vv)            # orthogonalize
         lr_adj = lr * sqrt(max(1, m/n))  # adjust for aspect ratio
         p = p - lr_adj * U               # update weights
     """
-    def __init__(self, params, lr=0.01, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.1):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
+    def __init__(self, params, lr=0.01, momentum=0.95, nesterov=True, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         super().__init__(params, defaults)
     
     @torch.no_grad()
@@ -209,14 +204,12 @@ class MuonFused(torch.optim.Optimizer):
                 # 0-D CPU tensors to avoid re-compilation when values change
                 lr = torch.tensor(lr, device='cpu', dtype=torch.float32)
                 momentum = torch.tensor(group['momentum'], device='cpu', dtype=torch.float32)
-                wd = torch.tensor(group['weight_decay'], device='cpu', dtype=torch.float32)
                 fused_muon_step(
                     params=stacked_params[:num_params_this_rank],
                     grad=stacked_grads[:num_params_this_rank],
                     momentum_buffer=self.state[p]['momentum_buffer'][:num_params_this_rank],
                     lr=lr,
                     momentum=momentum,
-                    wd=wd,
                     steps=group['ns_steps']
                 )
 
@@ -228,7 +221,7 @@ class MuonFused(torch.optim.Optimizer):
 
 
 
-def setup_optimizers(model, embedding_lr=0.3, unembedding_lr=0.003, matrix_lr=0.02, weight_decay=0.1):
+def setup_optimizers(model, embedding_lr=0.3, unembedding_lr=0.003, matrix_lr=0.02):
     """Prepare param groups and setup optimizers. Scale learning rates based on parameter counts"""
     assert isinstance(model, torch.nn.Module)
 
@@ -256,7 +249,6 @@ def setup_optimizers(model, embedding_lr=0.3, unembedding_lr=0.003, matrix_lr=0.
         lr=matrix_lr,
         momentum=0.95,
         ns_steps=5,
-        weight_decay=weight_decay,
     )
     
     # Set initial_lr in param groups for proper LR scaling

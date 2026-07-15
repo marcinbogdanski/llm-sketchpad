@@ -20,7 +20,6 @@ import json
 #     "embedding_lr": 0.3,
 #     "unembedding_lr": 0.003,
 #     "matrix_lr": 0.02,
-#     "weight_decay": 0.0,
 #     "profile": false
 #   },
 #   "ddp_spec": {
@@ -52,12 +51,12 @@ for run in runs[1:]:
     labels.append(label)
 
 # Print markdown table of results
-print("| label | matrix_lr | embedding_lr | unembedding_lr | weight_decay | final loss (mean last 10) |")
-print("|---|---:|---:|---:|---:|---:|")
+print("| label | matrix_lr | embedding_lr | unembedding_lr | final loss (mean last 10) |")
+print("|---|---:|---:|---:|---:|")
 for i, run in enumerate(runs):
     label = labels[i]
     args = run["args"]
     results = run["results"]
     print(f"| {label:>20} | {args['matrix_lr']:>6} | {args['embedding_lr']:>6} | " 
-          f"{args['unembedding_lr']:>6} | {args['weight_decay']:>6} | {results['loss_mean_last10']:.4f} |")
+          f"{args['unembedding_lr']:>6} | {results['loss_mean_last10']:.4f} |")
 

@@ -106,15 +106,14 @@ class MuonDist(torch.optim.Optimizer):
     """ZeRO-2 inspired version of Muon optimizer
     
     Algorithm:
-        p = p - lr * wd * p              # decoupled weight decay
         v = B * v + (1-B) * g            # momentum 
         vv = B * v + (1-B) * g           # optional, Nesterov look-ahead (just lerp again)
         U = newton_schulz(vv)            # orthogonalize
         lr_adj = lr * sqrt(max(1, m/n))  # adjust for aspect ratio
         p = p - lr_adj * U               # update weights
     """
-    def __init__(self, params, lr=0.01, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.1):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
+    def __init__(self, params, lr=0.01, momentum=0.95, nesterov=True, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         super().__init__(params, defaults)
     
     @torch.no_grad()
@@ -153,10 +152,6 @@ class MuonDist(torch.optim.Optimizer):
                             'momentum_buffer': torch.zeros_like(p),
                         }
 
-                    # Decoupled Weight Decay
-                    if group['weight_decay'] != 0:
-                        p.mul_(1 - group['lr'] * group['weight_decay'])
-
                     # Update v
                     # v = B1 * v + (1-B) * g
                     v = self.state[p]['momentum_buffer']
@@ -183,7 +178,7 @@ class MuonDist(torch.optim.Optimizer):
 
 
 
-def setup_optimizers(model, embedding_lr=0.3, unembedding_lr=0.003, matrix_lr=0.02, weight_decay=0.1):
+def setup_optimizers(model, embedding_lr=0.3, unembedding_lr=0.003, matrix_lr=0.02):
     """Prepare param groups and setup optimizers. Scale learning rates based on parameter counts"""
     assert isinstance(model, torch.nn.Module)
 
@@ -211,7 +206,6 @@ def setup_optimizers(model, embedding_lr=0.3, unembedding_lr=0.003, matrix_lr=0.
         lr=matrix_lr,
         momentum=0.95,
         ns_steps=5,
-        weight_decay=weight_decay,
     )
     
     # Set initial_lr in param groups for proper LR scaling

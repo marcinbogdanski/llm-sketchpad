@@ -1,5 +1,43 @@
 
 
+## 2026.07.15 Stages Sweep and Weight-Decay Issue
+
+A sweep across stages (`run_stages_sweep.sh`) with weight decay enabled across stages revealed a small issue. My expectation was that stages 0_builtin, 1_basic, 2_dist, 3_fused, 4_async would have closely overlapping loss curves (they implement same math). Stage 5_nanochat would have lower loss due to Muon extensions. Instead of uniform loss across 0-4, I observed is two sub-clusters: stages 0-2 landed at ~4.377–4.378 and 3-4 at ~4.386 (a +0.008 offset, ~40x the rerun noise of ~0.0002). The cause is stages 0-2 came from PyTorch built-in Muon, while stages 3-4 were achieved by pruning `nanochat` implementation, which uses slightly different convention on combining LR with WD
+
+PyTorch convention uses LR directly:
+
+```python
+# weight decay using 'raw' LR
+p.mul_(1 - group['lr'] * group['weight_decay'])
+# Later, LR scaled for params update only
+lr = group['lr'] * (max(1, p.size(0) / p.size(1)))**0.5
+p.add_(update, alpha=-lr)
+```
+
+Nanochat convention 
+```python
+# LR scaling FIRST
+lr = group['lr'] * (max(1, p.size(0) / p.size(1)))**0.5
+# Then, in fused kernel, scaled LR used for both weight decay and param update
+update_full = lr * update + lr * wd * params * mask
+params.sub_(update_full)
+```
+
+I think clearest educational value for this post is: "Stages 0-4 present same math, but progressively faster distributed implementation, while stage 5 presents Muon algorithmic extension". As such I decided to drop weight decay from stages 0-4 completely and hard-code value WD=0.1 for stage 5.
+
+After WD cleanup, we get clean table (4x3090, depth 12):
+
+| Stage | Step Time | Throughput | Max Memory | Final Loss (avg 10 steps) | NProc | Comment |
+|---|---:|---:|---:|---:|---:|---|
+|  0_builtin | 578.9 ms | 113K tok/s | 8.85 GB | 4.4079 | 4 | PyTorch DDP with built-in AdamW/Muon |
+|    1_basic | 582.9 ms | 112K tok/s | 8.85 GB | 4.4062 | 4 | PyTorch DDP with hand-written AdamW/Muon |
+|     2_dist | 663.8 ms |  99K tok/s | 7.85 GB | 4.4075 | 4 | Naive ZeRO-2 style optimizers, comms inside optimizers |
+|    3_fused | 660.2 ms |  99K tok/s | 7.85 GB | 4.4074 | 4 | ZeRO-2 style optimizers with fused compute sections (torch.compile) |
+|    4_async | 648.9 ms | 101K tok/s | 9.09 GB | 4.4056 | 4 | ZeRO-2 style, fused compute, hide comms behind compute |
+| 5_nanochat | 648.7 ms | 101K tok/s | 9.09 GB | 4.3542 | 4 | Muon extended with Polar Express, NorMuon, Cautious Weight Decay |
+
+Loss for stages 0-4 is closely clustered, while loss for stage drops down as expected. Notably throughput numbers confirm what was established earlier: ZeRO-2 does not provide improvement on 4x3090 and instead it is slower.
+
 ## 2026.07.14 Rerun Hyperparameter Sweep
 
 Rerun hyperparam sweep, changes since last run:

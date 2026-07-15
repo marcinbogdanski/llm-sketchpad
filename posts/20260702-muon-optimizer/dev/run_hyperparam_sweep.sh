@@ -17,4 +17,3 @@ OMP_NUM_THREADS=1 uv run torchrun --standalone --nproc_per_node=${NPROC} train.p
 OMP_NUM_THREADS=1 uv run torchrun --standalone --nproc_per_node=${NPROC} train.py --stage 5_nanochat --embedding-lr 0.6 "$@"
 OMP_NUM_THREADS=1 uv run torchrun --standalone --nproc_per_node=${NPROC} train.py --stage 5_nanochat --unembedding-lr 0.001 "$@"
 OMP_NUM_THREADS=1 uv run torchrun --standalone --nproc_per_node=${NPROC} train.py --stage 5_nanochat --unembedding-lr 0.03 "$@"
-OMP_NUM_THREADS=1 uv run torchrun --standalone --nproc_per_node=${NPROC} train.py --stage 5_nanochat --weight-decay 0.0 "$@"

@@ -231,7 +231,6 @@ def main():
     parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (AdamW)")
     parser.add_argument("--unembedding-lr", type=float, default=0.003, help="learning rate for unembedding parameters (AdamW)")
     parser.add_argument("--matrix-lr", type=float, default=0.02, help="Learning rate for matrix parameters (Muon)")
-    parser.add_argument("--weight-decay", type=float, default=0.1, help="Weight decay for the Muon optimizer (stages 0-4 plain WD, stage 5 Cautions WD)")
     parser.add_argument("--profile", action="store_true", help="Trace training step 10 with torch.profiler, export chrome trace per rank (open in ui.perfetto.dev)")
 
     args = parser.parse_args()
@@ -321,7 +320,6 @@ def main():
         embedding_lr=args.embedding_lr * dmodel_lr_scale,
         unembedding_lr=args.unembedding_lr * dmodel_lr_scale,
         matrix_lr=args.matrix_lr,
-        weight_decay=args.weight_decay
     )
 
     # Builtin and single-GPU optimizer version require DDP wrapping
