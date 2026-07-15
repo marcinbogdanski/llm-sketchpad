@@ -1,3 +1,23 @@
+## 2026.07.15 Scaling Sweep and Perfetto Traces
+
+Captured scaling sweep, stages 0_builtin and 5_nanochat, for number of GPUs: 1, 2 and 4 on my 4x3090 rig. Few notes:
+
+1) Speed - On 1x GPU sharded design in (`5_nanochat`) wins with DDP (`0_builtin`). I did not measure exactly why, likely fused kernel and/or no DDP overhead. On 2x GPUs `5_nanochat` looses by 68ms already, basically as soon as PCIe comes into the picture performance falls apart.
+
+2) Memory - `5_nanochat` extra staging buffers are clearly visible (8.85 GB DDP vs 11.59 ZeRO-2). Then as number of GPUs increase, memory requirement drops due to optimizer buffers being sharded. One could pre-allocate a contiguous buffer and make params views into it, that would be zero-copy, but quite invasive (aliasing, zero_grad)
+
+3) NCCL Time is ~378-385ms in all six stages - the entire progression changes where comms sits, but has no effect on how much comms is done.
+
+| Stage | Step Time | Throughput | Max Memory | Final Loss (avg 10 steps) | NProc | Comment |
+|---|---:|---:|---:|---:|---:|---|
+|  0_builtin | 330.2 ms |  50K tok/s |  8.85 GB | 6.9652 | 1 | PyTorch DDP with built-in AdamW/Muon |
+|  0_builtin | 402.7 ms |  81K tok/s |  8.85 GB | 6.5861 | 2 | PyTorch DDP with built-in AdamW/Muon |
+|  0_builtin | 579.3 ms | 113K tok/s |  8.85 GB | 6.4615 | 4 | PyTorch DDP with built-in AdamW/Muon |
+| 5_nanochat | 313.0 ms |  52K tok/s | 11.59 GB | 6.9447 | 1 | Muon extended with Polar Express, NorMuon, Cautious Weight Decay |
+| 5_nanochat | 470.6 ms |  70K tok/s |  9.73 GB | 6.5704 | 2 | Muon extended with Polar Express, NorMuon, Cautious Weight Decay |
+| 5_nanochat | 648.2 ms | 101K tok/s |  9.09 GB | 6.4464 | 4 | Muon extended with Polar Express, NorMuon, Cautious Weight Decay |
+
+Captured perfetto traces (all stages 0-5, single step). Quick eyeballing and agent check confirm the expected story: Stage 0_builtin and 1_basic are very similar. Stage 2_dist moves comms into optimizer, but not overlapping with compute. In 3_fused number of kernel launches drops visibly. Stage 4_async shows partial compute/comms overlap. Stage 5_nanochat is same as 4_async, since architecture didn't change.
 
 
 ## 2026.07.15 Stages Sweep and Weight-Decay Issue
