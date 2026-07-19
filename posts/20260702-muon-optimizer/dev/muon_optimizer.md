@@ -263,3 +263,198 @@ The `setup_optimizers()` function is responsible for grouping params, creating p
 
 <span style="color: red;">TODO: FIX/CONFIRM LINKS</span>
 
+## Stage 0 - PyTorch Reference
+
+Stage [optim_0_builtin.py](optim_0_builtin.py) is using PyTorch built-in implementations of AdamW and Muon.
+
+```python
+import torch
+
+OPTIMIZERS_OWN_COMMS = False  # Trainer script needs to wrap model in DDP
+
+def setup_optimizers(model, embedding_lr=0.3, unembedding_lr=0.003, matrix_lr=0.02):
+    # ...
+
+    adamw_optimizer = torch.optim.AdamW(...)
+    # ...
+    
+    # pass weight_decay=0.0 explicitly: torch.optim.Muon defaults to 0.1
+    muon_optimizer = torch.optim.Muon(muon_groups, lr=matrix_lr, momentum=0.95, ns_steps=5, weight_decay=0.0)
+    # ...
+    
+    optimizers = [adamw_optimizer, muon_optimizer]
+    return optimizers
+```
+
+The `optim_0_builtin.py` contains two things: the `OPTIMIZERS_OWN_COMMS` flag telling train script to wrap model in PyTorch DDP, and `setup_optimizers()` which instantiates `torch.optim.AdamW` and `torch.optim.Muon`.
+
+Let's have a look at the Perfetto trace:
+
+![](assets/stage_0a_full.png)
+
+_Image: 8xH200, d26, single step, rank 0 - other 7 ranks look the same_
+
+On the CPU side we have: `thread 50702` is Python main thread (code we write), `thread 50858` is PyTorch autograd worker (roughly, handles backward pass), `adamw_step` (too thin to see) and `muon_step`. These are async dispatch operations to the GPU. Interestingly `muon_step` dominates the CPU side with 1,274 CUDA kernel launches in ~305ms - we will improve that in section `3_fused`.
+
+On GPU side we see `stream 7 7` (compute) and `stream 23 23` (comms). Notice how communication starts almost as soon as backward pass compute starts and overlaps through the whole backward pass. DDP wrapper is doing this for us through hooks. Thanks to that AdamW (very thin) can start right after backward completes and Muon follows after AdamW.
+
+What is not obvious is that optimizers across GPUs redundantly compute same update, using exactly identical gradient inputs.
+
+Baseline recorded on 8xH200:
+
+| Stage | Step Time | Throughput | Max Memory | Final Loss (avg 10 steps) | Comment |
+|---|---:|---:|---:|---:|---|
+| 0_builtin | 529.2 ms | 495K tok/s | 67.8 GB | 6.1640 | PyTorch DDP with built-in AdamW/Muon |
+
+_Table: recorded on 8xH200, model depth 26 (~1.03B), batch 32x1024 per GPU (262K tok/step)_
+
+<span style="color: red;">TODO: FIX LINKS, THREAD IDS if image swapped, consider cropping or addressing remaining rows on the image, update launched kernels number</span>
+
+## Stage 1 - AdamW/Muon Basic Implementations
+
+In [optim_1_basic.py](optim_1_basic.py) we swap-in PyTorch optimizers with our own first. AdamW first:
+
+```text
+adamw_step():
+    p = p - lr * wd * p                # decoupled weight decay
+    v = B1 * v + (1 - B1) * g          # first moment (direction)
+    s = B2 * s + (1 - B2) * g^2        # second moment (scaling)
+    v_corrected = v / (1 - B1^t)       # bias correction
+    s_corrected = s / (1 - B2^t)
+    p = p - lr * v_corrected / (sqrt(s_corrected) + eps)
+```
+
+AdamW update is standard momentum `v` divided by square root of second moment `s`. Bias corrections avoid initial updates being biased towards zero. Weight decay is applied directly to the params. AdamW buffers (`v` and `s`) take 2x memory size of the params - since all GPUs hold a copy, it is a substantial amount wasted.
+
+```python
+# optim_1_basic.py
+
+OPTIMIZERS_OWN_COMMS = False  # Trainer script needs to wrap model in DDP
+
+class AdamWBasic(torch.optim.Optimizer):
+    # ...
+    
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                # Init Buffers
+                # ...
+
+                # Weight Decay
+                p.mul_(1 - group['lr'] * group['weight_decay'])
+
+                # AdamW Update
+                # ...
+                update = ...
+
+                p.add_(update, alpha=-1.0)
+```
+
+AdamW implementation is fairly simple: loop over param groups and params, apply two updates: decoupled weight decay and optimizer update. I'm skipping details for brevity.
+
+Let's have a look at the Muon next:
+
+```text
+muon_step():
+    v = B * v + (1-B) * g            # momentum 
+    vv = B * v + (1-B) * g           # optional, Nesterov look-ahead (just lerp again)
+    U = newton_schulz(vv)            # orthogonalize
+    lr_adj = lr * sqrt(max(1, m/n))  # adjust for aspect ratio
+    p = p - lr_adj * U               # update weights
+
+newton_schulz(vv):
+    X = vv / ||vv||                        # scale so singular values < 1
+    repeat 5 times:
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X
+```
+
+Similar to AdamW, Muon also uses standard momentum (with optional Nesterov look-ahead), but the AdamW per-element second moment normalization (`1/sqrt(s)`) is replaced with matrix orthogonalization step. **This is why Muon operates on 2D matrices only**, and not individual elements like AdamW. The rough intuition is: raw gradient/momentum matrices are dominated by few large directions and orthogonalization counter that, so "small" directions also get meaningful "step size". Due to computational cost exact SVD is replaced with Newton–Schulz iteration. The aspect ratio adjustment keeps the update magnitude consistent across matrix aspect ratios. I won't pretend to understand this deeply enough to be able to explain, I take update math as given, and leave explanation to [Jordan Post](https://kellerjordan.github.io/posts/muon/).
+
+Below I'm including full Newton-Schulz and Muon code:
+
+```python
+@torch.compile
+def zeropower_via_newtonschulz(grad, steps=5):
+    a, b, c = 3.4445, -4.7750, 2.0315    # Keller Jordan's coefficients 
+    X = grad.bfloat16()                  # sufficient and faster
+    if grad.size(0) > grad.size(1):      # transpose if tall
+        X = X.T
+
+    # Scale down to norm at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if grad.size(0) > grad.size(1):
+        X = X.T
+    return X
+```
+
+The `zeropower_via_newtonschulz()` is pure math and `ns_step=5` is held constant across training run. Because of this it is an easy target for `@torch.compile()` decorator. The same is not trivially true for `step()` function and we will address it in stage `3_fused`. We run orthogonalization in bfloat16 for speed. The 'transpose-if-tall' is to ensure `X @ X.mT` is the smaller Gram matrix.
+
+```python
+class MuonBasic(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.01, momentum=0.95, nesterov=True, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+    
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                # Lazy Init buffers
+                if p not in self.state:
+                    self.state[p] = {'momentum_buffer': torch.zeros_like(p)}
+
+                # Update momentum v
+                # v = B1 * v + (1-B) * g
+                v = self.state[p]['momentum_buffer']
+                v.lerp_(p.grad, 1 - group['momentum'])
+
+                # Nesterov look-ahead
+                # vv = B*v + (1-B)*g
+                vv = p.grad.lerp(v, group['momentum']) if group['nesterov'] else v
+
+                # Calculate update
+                update = zeropower_via_newtonschulz(vv, group['ns_steps'])
+
+                # Update params
+                lr = group['lr'] * (max(1, p.size(0) / p.size(1)))**0.5
+                p.add_(update, alpha=-lr)
+```
+
+Muon code has same structure as AdamW: loop over param groups and params, calculate and apply update. Weight decay is omitted for simplicity and will be introduces as Cautious Weight Decay in `5_nanochat`
+
+The most important part, worth reiterating, is that Muon **must** operate on full 2D matrices. This will be critical difference from AdamW when implementing distributed version.
+
+Let's see how we are doing compared to `0_builtin`:
+
+| Stage | Step Time | Throughput | Max Memory | Final Loss (avg 10 steps) | Comment |
+|---|---:|---:|---:|---:|---|
+| 0_builtin | 529.2 ms | 495K tok/s | 67.8 GB | 6.1640 | PyTorch DDP with built-in AdamW/Muon |
+| 1_basic | 537.9 ms | 487K tok/s | 67.8 GB | 6.1637 | PyTorch DDP with hand-written AdamW/Muon |
+
+_Table: recorded on 8xH200, model depth 26 (~1.03B), batch 32x1024 per GPU (262K tok/step)_
+
+First let's notice the loss matches between stages to ~3 decimal places - this is a good correctness check. Secondly the step time increased from 529.2->537.9ms (8.7ms, 1.6%). The regression is due to hand-written optimizers:
+
+- in stage `0_builtin` we create AdamW with `fused=True`
+- PyTorch version of Newton-Schultz combines matrix operations like `B = b * A + c * A @ A` into fused GEMMs via `addmm`.
+
+Because of that our `1_basic` versions result in more kernel launches (bad). Interestingly, comparing to model depth 12:
+
+<span style="color: red;">INSERT TABLE D12 on 8xH200 stages 0-1 only, update numbers in prose</span>
+
+It seems regression is roughly equal in absolute terms (8.7ms vs 9.6ms), but relative slowdown is much greater at lower depth because shorter steps expose it more: 53.0->62.6 (9.6ms, 18%).
+
+<span style="color: red;">TODO: FIX LINKS, THREAD IDS if image swapped, consider cropping or addressing remaining rows on the image, update launched kernels number</span>
