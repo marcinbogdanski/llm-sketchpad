@@ -23,12 +23,13 @@ class AdamWDist(torch.optim.Optimizer):
                 slice_width = p.size(0) // world_size
                 slice_start = rank * slice_width
                 slice_end = slice_start + slice_width
+                p_slice = p[slice_start:slice_end]  # view
 
                 if p not in self.state:
                     self.state[p] = {
                         'step': torch.tensor(0, dtype=torch.int64, device=p.device),
-                        'exp_avg': torch.zeros_like(p[:slice_width]),
-                        'exp_avg_sq': torch.zeros_like(p[:slice_width]),
+                        'exp_avg': torch.zeros_like(p_slice),
+                        'exp_avg_sq': torch.zeros_like(p_slice),
                     }
                 self.state[p]['step'] += 1
 
@@ -36,7 +37,7 @@ class AdamWDist(torch.optim.Optimizer):
                 if group['weight_decay'] != 0.0:
                     # AdamW
                     # p = p - lr * weight_decay * p
-                    p[slice_start:slice_end].mul_(1 - group['lr'] * group['weight_decay'])
+                    p_slice.mul_(1 - group['lr'] * group['weight_decay'])
 
                 # Sync point 1
                 grad_slice = torch.empty_like(p.grad[:slice_width])
@@ -62,8 +63,8 @@ class AdamWDist(torch.optim.Optimizer):
                 bias1 = 1-group['betas'][0]**t
                 bias2 = 1-group['betas'][1]**t
                 denom = (s / bias2).sqrt().add_(group['eps'])
-                update = v.div(denom).mul_(-group['lr'] / bias1)
-                p_slice = p[slice_start:slice_end] + update
+                update = v.div(denom).mul_(group['lr'] / bias1)
+                p_slice.add_(update, alpha=-1.0)
 
                 # Sync point 2
                 torch.distributed.all_gather_into_tensor(p, p_slice)
@@ -101,6 +102,11 @@ def zeropower_via_newtonschulz(grad, steps=5):
         X = X.T
     return X
 
+def pad_to_world_size(tensor_list, world_size):
+    short_by = (-len(tensor_list)) % world_size
+    if short_by == 0:
+        return tensor_list
+    return tensor_list + [torch.zeros_like(tensor_list[0]) for _ in range(short_by)]
 
 class MuonDist(torch.optim.Optimizer):
     """ZeRO-2 inspired version of Muon optimizer
@@ -124,26 +130,20 @@ class MuonDist(torch.optim.Optimizer):
         # Assert all grads exist
         assert all(p.grad is not None for group in self.param_groups for p in group["params"])
 
-        # Sync point 1
-        # This will reduce scatter grads, such that each rank gets full averaged grad for owned param
+        # Reduce Scatter Grads - each rank gets full averaged grad for owned param
         for group in self.param_groups:
-            if len(group['params']) % world_size != 0:
-                group['zero_buffer'] = torch.zeros_like(group['params'][0].grad)
-            for i in range(0, len(group['params']), world_size):
+            for i in range(0, len(group['params']), world_size):                # iterate 'world_size' params at a time
+
+                # Sync point 1
+                if i+rank < len(group['params']):    # handle padded/non-padded params
+                    out_tensor = group['params'][i+rank].grad                   # reduce_scatter will write into the owned param's grad
+                else:
+                    out_tensor = torch.zeros_like(group['params'][0].grad)      # reduce_scatter will write into scratch tensor for padded params
                 input_grads = [p.grad for p in group['params'][i:i+world_size]]
-                if len(input_grads) < world_size:
-                    input_grads.extend([group['zero_buffer']] * (world_size - len(input_grads)))
-                out_tensor = group['params'][i+rank].grad if i+rank < len(group['params']) else torch.zeros_like(group['zero_buffer'])
-                torch.distributed.reduce_scatter(
-                    out_tensor,
-                    input_grads,
-                    op=torch.distributed.ReduceOp.AVG
-                )
+                input_grads_padded = pad_to_world_size(input_grads, world_size)
+                torch.distributed.reduce_scatter(out_tensor, input_grads_padded, op=torch.distributed.ReduceOp.AVG)  # in-place: output aliases this rank's input slot
             
-        for group in self.param_groups:
-            for i in range(0, len(group['params']), world_size):
-                if i+rank < len(group['params']):
-                
+                if i+rank < len(group['params']):  # handle padded/non-padded params
                     p = group['params'][i+rank]
 
                     # Lazy Init
@@ -167,13 +167,12 @@ class MuonDist(torch.optim.Optimizer):
                     p.add_(update, alpha=-lr)
                     input_tensor = p
                 else:
-                    input_tensor = torch.zeros_like(group['zero_buffer'])
+                    input_tensor = torch.zeros_like(group['params'][0])  # dummy tensor for padded params
 
                 # Sync point 2
                 output_params = [p for p in group['params'][i:i+world_size]]
-                if len(output_params) < world_size:
-                    output_params.extend(torch.zeros_like(group['zero_buffer']) for _ in range(world_size - len(output_params)))
-                torch.distributed.all_gather(output_params, input_tensor)
+                output_params_padded = pad_to_world_size(output_params, world_size)
+                torch.distributed.all_gather(output_params_padded, input_tensor)
 
 
 

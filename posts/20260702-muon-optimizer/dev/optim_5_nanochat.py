@@ -141,12 +141,13 @@ class AdamWAsync(torch.optim.Optimizer):
                 slice_width = params.size(0) // world_size
                 slice_start = rank * slice_width
                 slice_end = slice_start + slice_width
+                params_slice = params[slice_start:slice_end]  # view
 
                 if params not in self.state:
                     self.state[params] = {
                         'step': 0,
-                        'exp_avg': torch.zeros_like(params[:slice_width]),
-                        'exp_avg_sq': torch.zeros_like(params[:slice_width]),
+                        'exp_avg': torch.zeros_like(params_slice),
+                        'exp_avg_sq': torch.zeros_like(params_slice),
                     }
                 self.state[params]['step'] += 1
 
@@ -155,7 +156,6 @@ class AdamWAsync(torch.optim.Optimizer):
                 future = torch.distributed.reduce_scatter_tensor(
                     grad_slice, params.grad, op=torch.distributed.ReduceOp.AVG, async_op=True
                 ).get_future()
-                params_slice = params[slice_start:slice_end]
 
                 temp_buffers[(i,j)] = {
                     'future': future,
@@ -206,6 +206,13 @@ class AdamWAsync(torch.optim.Optimizer):
 
         
 
+def pad_to_world_size(tensor_list, world_size):
+    short_by = (-len(tensor_list)) % world_size
+    if short_by == 0:
+        return tensor_list
+    return tensor_list + [torch.zeros_like(tensor_list[0]) for _ in range(short_by)]
+
+
 class MuonNanochat(torch.optim.Optimizer):
     """ZeRO-2 inspired version of Muon optimizer
     
@@ -232,16 +239,10 @@ class MuonNanochat(torch.optim.Optimizer):
         # This will reduce scatter grads, such that each rank gets full averaged grad for owned param
         for i, group in enumerate(self.param_groups):
             p = group['params'][0]  # shape, dtype, device
-            num_params = len(group['params'])
-            padded_num_params = ((len(group['params']) + world_size - 1) // world_size) * world_size
+            padded_grads = pad_to_world_size([p.grad for p in group['params']], world_size)
+            padded_num_params = len(padded_grads)
             num_params_per_rank = padded_num_params // world_size
 
-            if len(group['params']) % world_size != 0:
-                group['zero_buffer'] = torch.zeros_like(group['params'][0].grad)
-
-            padded_grads = [p.grad for p in group['params']]
-            if len(group['params']) % world_size != 0:
-                padded_grads.extend([group['zero_buffer']] * (padded_num_params-len(group['params'])))
             stacked_all_grads = torch.stack(padded_grads)
             stacked_grads = torch.empty(num_params_per_rank, *p.shape, dtype=p.dtype, device=p.device)
 
@@ -272,9 +273,7 @@ class MuonNanochat(torch.optim.Optimizer):
 
             # Sync point 2
             idx_start = num_params_per_rank * rank
-            padded_params = [p for p in group['params']]
-            if len(group['params']) % world_size != 0:
-                padded_params.extend([group['zero_buffer']] * (padded_num_params-len(group['params'])))
+            padded_params = pad_to_world_size(list(group['params']), world_size)
             stacked_params = torch.stack(padded_params[idx_start:idx_start+num_params_per_rank])
 
             # Create buffers
