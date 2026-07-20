@@ -458,3 +458,156 @@ Because of that our `1_basic` versions result in more kernel launches (bad). Int
 It seems regression is roughly equal in absolute terms (8.7ms vs 9.6ms), but relative slowdown is much greater at lower depth because shorter steps expose it more: 53.0->62.6 (9.6ms, 18%).
 
 <span style="color: red;">TODO: FIX LINKS, THREAD IDS if image swapped, consider cropping or addressing remaining rows on the image, update launched kernels number</span>
+
+## Stage 2 - Distributed Implementation
+
+In the [optim_2_dist.py](optim_2_dist.py) we are switching from PyTorch DDP to custom implementation of cross-GPU communication in the optimizer code. 
+
+```diff
+# diff optim_1_basic.py optim_2_dist.py
+-OPTIMIZERS_OWN_COMMS = False  # Trainer script needs to wrap model in DDP
++OPTIMIZERS_OWN_COMMS = True  # Muon handles distributed comms, model should not be wrapped in DDP
+```
+
+With DDP magic disabled our starting point is this: each GPU did a forward/backward pass on different data batch. Params are in sync (same init seed, no broadcast anymore), but **gradients differ between GPUS**. In earlier stages DDP did gradient all-reduce (overlapped with backward) for us - this is now gone.
+
+Here is what we want to achieve:
+
+- assign to each GPU which params does it own exactly
+- take gradients and reduce-scatter them, so each GPU gets true gradient (averaged from all GPUs) for it's owned param chunk
+- on each GPU compute optimizer update for it's owned param chunk, and apply it to params chunk
+- all-gather params across GPUs, so every rank has all params updated and identical before next step
+
+The key part is how to assign params between GPUs:
+
+For AdamW it's easy, since each individual parameter scalar is independently updated, we can shard param tensor across GPUs. Gradient for embedding `wte` is sliced 8-ways, `lm_head` is sliced 8-ways and so on. Lets have a look at the most important difference compared to stage `1_basic`:
+
+```diff
+ def step(self):
+     rank = torch.distributed.get_rank()
+     world_size = torch.distributed.get_world_size()
+
+     for group in self.param_groups:
+         for p in group['params']:
+
+             # Establish owned slice
+             assert p.size(0) % world_size == 0, f"Param shape {p.shape} not divisible by world size"
++            slice_width = p.size(0) // world_size
++            slice_start = rank * slice_width
++            slice_end = slice_start + slice_width
++            p_slice = p[slice_start:slice_end]  # view
+
+             # Lazy buffer init - only for the slice
+             if p not in self.state:
+                 self.state[p] = {
+                     'step': torch.tensor(0, dtype=torch.int64, device=p.device),
++                    'exp_avg': torch.zeros_like(p_slice),
++                    'exp_avg_sq': torch.zeros_like(p_slice),
+                 }
+
+             # Weight Decay - only owned slice
++            p_slice.mul_(1 - group['lr'] * group['weight_decay'])
+
+             # Sync point 1 - average grads across ranks and put in grad_slice
+-            grad_slice = torch.empty_like(p.grad[:slice_width])
+-            torch.distributed.reduce_scatter_tensor(grad_slice, p.grad, op=torch.distributed.ReduceOp.AVG)
+
+             # Update - owned slice only!
+             update = ...
++            p_slice.add_(update, alpha=-1.0)
+
+             # Sync point 2 - sync updated params across ranks
+-            torch.distributed.all_gather_into_tensor(p, p_slice)
+```
+
+There are two main changes:
+
+1) The ownership - for each param tensor, each rank owns only a slice. On 8xGPU system the code slices the param tensor 8-ways, calculates start/end of the owned slice and creates `p_slice` view. The AdamW buffers are created with `p_slice` size. This is the memory saving. Then both WD update and optimizer step update params tensor via `p_slice` view. This is the compute saving.
+
+2) Comms - The `Sync point 1` does reduce-scatter to populate `grad_slice` with correct averaged gradient based on all 8 ranks. The `Sync point 2` all-gathers param slices across all ranks, ensuring param tensor is in sync across ranks after step completes. 
+
+In this stage both communication primitives are called synchronously - no overlap with compute (and definitely not with the backward pass). This is deliberate at this stage and will be addressed in stage `4_async`. Notably reduce-scatter followed by all-gather has same cost as all-reduce, which was done by DDP wrapper in earlier stages. So we did not add communication cost, but we moved it out of backward pass naively (for now) into optimizer step.
+
+Now let's have a look how to implement distributed Muon, and how it differs from AdamW:
+
+```diff
+ def step(self):
+     rank = torch.distributed.get_rank()
+     world_size = torch.distributed.get_world_size()
+
+     # Reduce Scatter Grads - each rank gets full averaged grad for owned param
+     for group in self.param_groups:
++        for i in range(0, len(group['params']), world_size):                # iterate 'world_size' params at a time
+
+             # Prepare tensors - handle padded/non-padded params differently
+             if i+rank < len(group['params']):
+                 out_tensor = group['params'][i+rank].grad                   # reduce_scatter will write into the owned param's grad
+             else:
+                 out_tensor = torch.zeros_like(group['params'][0].grad)      # reduce_scatter will write into scratch tensor for padded params
+             input_grads = [p.grad for p in group['params'][i:i+world_size]]
+             input_grads_padded = pad_to_world_size(input_grads, world_size)
+
+             # Sync point 1
+-            torch.distributed.reduce_scatter(out_tensor, input_grads_padded, op=torch.distributed.ReduceOp.AVG)
+        
+             # Prepare tensors - handle padded/non-padded params differently
+             if i+rank < len(group['params']):
+                 # Get owned matrix
++                p = group['params'][i+rank]
+
+                 # Lazy Init - create buffer for owned params matrix
+                 if p not in self.state:
++                    self.state[p] = {
++                        'momentum_buffer': torch.zeros_like(p),
++                    }
+
+                 # Update - owned matrix only!
+                 update = ...
+                 lr = group['lr'] * (max(1, p.size(0) / p.size(1)))**0.5
++                p.add_(update, alpha=-lr)
+                 input_tensor = p
+             else:
+                 input_tensor = torch.zeros_like(group['params'][0])  # dummy tensor for padded params
+             output_params = [p for p in group['params'][i:i+world_size]]
+             output_params_padded = pad_to_world_size(output_params, world_size)
+             # Sync point 2
+-            torch.distributed.all_gather(output_params_padded, input_tensor)
+```
+
+Let's consider how ownership and comms look different:
+
+1) The ownership - iterate param group in W-size chunks (world size), each rank owns one whole param matrix from that chunk. Pad last chunk as needed. For example a depth 12 model on a 8xGPU system has a param group of 12x `c_fc` matrices. Chunks are: [0,1,2,3,4,5,6,7] and [8,9,10,11,zeros,zeros,zeros,zeros]. Rank 0 owns params [0,8] and so on. Params `p` and momentum buffer, update are full not-sliced matrices. Note that if padding on last chunk is needed, then some "tail" ranks will do no work.
+
+2) Comms - The tricky part is padding on the last chunk. Let's take our example from above: [8,9,10,11,zeros,zeros,zeros,zeros]. In the `Sync point 1` the function `reduce_scatter()` requires 8-element list, so `input_grads` needs to be padded with `pad_to_world_size()`. On ranks 0-3 the `out_tensor` is corresponding param `.grad`, but on ranks 4-7 we need to "invent" a dummy buffer. Also note that `out_tensor` aliases one of tensors in `input_grads_padded` - this is a standard in-place pattern. Similarly in `Sync point 2` the `all_gather()` needs full output list of 8-elements. We pad `output_params` and "invent" `input_tensor` on ranks that have no work to do.
+
+Let's see how it looks in Perfetto now:
+
+![](assets/stage_0a_full.png)
+
+In the profiled step (this is separate from table below, slightly slower) improved from 533.2->434.6 (~99 ms) between stages `0_builtin` and `2_dist`. We gained in two places:
+
+1) Optimizers - combined optimizer time reduced from 101.2->46.6 ms (~54.6 ms). This is due to reducing redundant work, mostly in Muon (comparatively AdamW takes little time)
+2) Backward Pass - 297.7->259.5ms (38.2ms). PyTorch DDP deliberately partitions the compiled backward pass so it can run comms alongside. Without DDP backward is single clean compiled graph.
+
+The results table (w/o profiler, slightly faster) looks now as follows:
+
+| Stage | Step Time | Throughput | Max Memory | Final Loss (avg 10 steps) | Comment |
+|---|---:|---:|---:|---:|---|
+| 0_builtin | 529.2 ms | 495K tok/s | 67.8 GB | 6.1640 | PyTorch DDP with built-in AdamW/Muon |
+| 1_basic | 537.9 ms | 487K tok/s | 67.8 GB | 6.1637 | PyTorch DDP with hand-written AdamW/Muon |
+| 2_dist | 445.6 ms | 588K tok/s | 57.6 GB | 6.1636 | Naive ZeRO-2 style optimizers, comms inside optimizers |
+
+_Table: recorded on 8xH200, model depth 26 (~1.03B), batch 32x1024 per GPU (262K tok/step)_
+
+As expected. Table presents both speed gain and ~10GB peak step memory reduction. The prof of concept sharded optimizer works and doing it's job. Also loss matches between stages to ~3 decimal places, further confirming sanity of our implementation
+
+<span style="color: red;">TODO: FIX LINKS, SWAP IMAGE, image THREAD IDS in prose, update numbers </span>
+
+
+
+
+
+
+---
+END OF DOC
+
