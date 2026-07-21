@@ -64,7 +64,7 @@ Experiments were performed with model depth 12 or 26 (`n_layer`, depending on ex
 - the LRs for AdamW (`embedding_lr`, `unembedding_lr`) and Muon (`matrix_lr`) are result of a quick sanity sweep (see [run_hyperparam_sweep.sh](run_hyperparam_sweep.sh), stage 5, d12, W=4, 500 steps, single seed).
 - in addition AdamW LRs are scaled by muP-flavored heuristic `(n_embd/768)**-0.5` which has effect for depths `n_layer != 12`
 - weight decay - enabled for Muon stage `5_nanochat` for Cautious Weight Decay at `WD=0.1`. Disabled otherwise throughout for Muon and AdamW
-- other params for Muon (`momentum=0.95`, `ns_steps=5`), AdamW (`betas=(0.9, 0.95)`), LR scheduler (50 step warmup, hold, 40% linear warmdown to 0.1) come from `nanochat`/PyTorch conventions.
+- other params for Muon (`momentum=0.95`, `ns_steps=5`), AdamW (`betas=(0.9, 0.95)`), LR scheduler (50 step warmup, hold, 40% linear warmdown to 0.1) come from PyTorch conventions.
 
 Let's move on to high level structure of `train.py`:
 
@@ -603,8 +603,152 @@ As expected. Table presents both speed gain and ~10GB peak step memory reduction
 
 <span style="color: red;">TODO: FIX LINKS, SWAP IMAGE, image THREAD IDS in prose, update numbers </span>
 
+## Stage 3 - Fused Optimizer Compute Graph
 
+Looking at the Perfetto plot from stage `2_dist` we have a problem:
 
+![](assets/stage_0a_full.png)    // dummy link for now, replace with copy of 2_dist with clearly indicated CPU path nearly as long as GPU path
+
+Currently AdamW performs 63 kernel launches (57 compute, 6 NCCL) and Muon whopping 694 (652 compute, 42 NCCL). The annotated CPU time on the plot does not necessarily mean CPU is 100% busy. Also, GPU side is already saturated. Because of that we don't expect huge improvement. Having said that, it is unnecessary overhead and looks "ugly" so lets reduce it.
+
+We will approach it from two sides:
+
+1) In both AdamW/Muon we will refactor compute into fused optimizer step - wrap as much of the graph under explicit `@torch.compile` as feasible
+2) In Muon we will stack params/grads into one larger staging buffer - replace many small kernel launches with fewer larger ones, at the cost of creating staging buffer.
+
+First, let's rewrite Muon math into fused step function:
+
+```python
+@torch.compile(dynamic=False, fullgraph=True)
+def fused_muon_step(params, grad, momentum_buffer, momentum, lr, steps=5):
+    # Update with Nesterov look-ahead
+    v = momentum_buffer
+    v.lerp_(grad, 1 - momentum)
+    vv = grad.lerp(v, momentum)
+    # Zeropower via Newton-Schulz
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = vv.bfloat16()
+    if vv.size(-2) > vv.size(-1):  # replaced from hard-coded 0 and 1
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if vv.size(-2) > vv.size(-1):
+        X = X.mT
+    update = X
+    # Update Params
+    params.sub_(lr * update)    # replaced from: p.add_(update, alpha=-lr)
+```
+
+Firstly, the `@torch.compile(dynamic=False, fullgraph=True)` means one graph per shape, and no graph breaks, respectively. Both are good for performance and catching unintended graph breaks early.
+
+Secondly, the function parameters: `params`, `grad` and `momentum_buffer` are tensors, but `momentum` and `lr` **are 0-D tensors as well**. `lr` specifically changes every time step due to LR scheduler. A changing float param would trigger torch recompile every step, which would be a disaster for performance. This is why we are passing 0-D tensors instead: to avoid recompiles every step. Simple way to confirm there is no excessive re-compilation is to run script with `TORCH_LOGS=recompiles`. The expectation is one compile per Muon param group (three here). Also note that passing 0-D tensor to `alpha=-lr` causes type error so the line was migrated from `p.add_(update, alpha=-lr)` in stage `2_dist` to `params.sub_(lr * update)` here.
+
+Thirdly, hardcoded dimensions `0,1` are replaced with `-2,-1` to allow function to handle 3D stacked tensors for `prams` and `grads`. We will explore it shortly.
+
+Let's look at the actual Muon step function:
+
+```diff
+     def step(self):
+         assert all(p.grad is not None for group in self.param_groups for p in group["params"])
+         rank = torch.distributed.get_rank()
+         world_size = torch.distributed.get_world_size()
+
+         # Reduce Scatter Grads - each rank gets full averaged grad for owned param
+         for group in self.param_groups:
+             # for i in range(0, len(group['params']), world_size):            # <- inner loop now removed
+
+             p = group['params'][0]  # 'p' variable is used mainly as handle
+
+             # Staging buffer 1 - grads
++            num_real = len(group['params'])                                   # real params, before padding
++            chunk_size = (num_real + world_size - 1) // world_size            # params per rank (ceil div)
++            stacked_all_grads = torch.stack(pad_to_world_size([p.grad for p in group['params']], world_size))
++            stacked_grads = torch.empty_like(stacked_all_grads[:chunk_size])  # this rank's chunk
+
+             # Sync point 1
+-            torch.distributed.reduce_scatter_tensor(
+-                output=stacked_grads,
+-                input=stacked_all_grads,
+-                op=torch.distributed.ReduceOp.AVG
+-            )
+
+             # NOTE: We will break into two loops here later, when implementing async comms
+
+             # Staging buffer 2 - params
++            idx_start = chunk_size * rank
++            padded_all_params = pad_to_world_size(list(group['params']), world_size)
++            stacked_params = torch.stack(padded_all_params[idx_start:idx_start+chunk_size])  # this rank's chunk
+
+             # Lazy init momentum buffers
+             if 'momentum_buffer' not in self.state[p]:
++                self.state[p]['momentum_buffer'] = torch.zeros_like(stacked_params)
+
+             num_params_this_rank = min(chunk_size, max(0, num_real - idx_start))
+             if num_params_this_rank > 0:
+
+                 # Scale LR
+                 lr = group['lr'] * (max(1, p.size(0) / p.size(1)))**0.5
+
+                 # Convert to 0-D CPU tensors to avoid re-compilation when values change
+                 lr = torch.tensor(lr, device='cpu', dtype=torch.float32)
+                 momentum = torch.tensor(group['momentum'], device='cpu', dtype=torch.float32)
+
+                 # Call Fused Step
+                 fused_muon_step(
+                     params=stacked_params[:num_params_this_rank],
+                     grad=stacked_grads[:num_params_this_rank],
+                     momentum_buffer=self.state[p]['momentum_buffer'][:num_params_this_rank],
+                     lr=lr,
+                     momentum=momentum,
+                     steps=group['ns_steps']
+                 )
+
+             # Sync point 2 - Reuse the stacked_all_grads buffer for params
+-            torch.distributed.all_gather_into_tensor(stacked_all_grads, stacked_params)
+
+             # Copy Back - copy back to actual params
++            torch._foreach_copy_(group["params"], list(stacked_all_grads[:num_real].unbind(0)))
+```
+
+In `Staging buffer 1` we take **all** grads from the group, pad to a multiple of world_size, and stack into 3D `stacked_all_grads` tensor. All grads need to be stacked because this is what reduce-scatter requires.
+
+The `stacked_grads` is created to hold rank owned grads as a 3D stacked tensor (which may be partially padded on some ranks)
+
+Then in `Sync point 1` reduce-scatter operation is performed populating `stacked_grads` with true gradients averaged from all ranks. Let's take previous example of depth 12 model on 8xGPU having 12x `c_fc` matrices. This time `stacked_all_grads` holds [0,1,2,3,4,5,6,7,8,9,10,11,zeros,zeros,zeros,zeros], rank 0 `stacked_grads` chunk is [0,1] and so on up to [zeros,zeros]. In this example ranks 6 and 7 are fully idle (for that param group at least). Same math, different rank assignment. Note that variable `stacked_all_grads` is "consumed" in a sense values it holds are no longer necessary.
+
+`Staging buffers 2` does somewhat analogous stacking for the params - with the difference that **only** owned params are stacked (all we need).  Rank owned params placed in `stacked_params`. A single contiguous `momentum_buffer` is allocated using `p` (group first param object) as a "handle".
+
+Then `lr` and `momentum` scalars are converted to 0-D tensors and `fused_muon_step` is called, resulting in single compiled graph call (per rank). The `num_params_this_rank > 0` is a bypass on idle ranks.
+
+After the muon step, in `Sync point 2` we all-gather params back - so all updated and synchronized params land in (confusingly) `stacked_all_grads`. Since `stacked_all_grads` was "consumed" earlier, and we need a tensor of exactly that shape/dtype, we reuse it.
+
+Since the muon step operated on a copy of grads/params, in `Copy Back` section we need to copy back all params back from `stacked_all_grads` (which now holds params!) to individual locations.
+
+Regarding AdamW, similarly to Muon we implement fused step function, but we **do not** implement stacked tensors or change the communication. In our model Adam handles only three params: `wte`, `wpe` in param group 1 and `lm_head` in param group 2. The `wte` and `wpe` could be flattened (shapes 50304x768 and 1024x768 are not good fit for stacking and AdamW is element-wise), but likely benefit is not there to justify memory and code complexity cost (AdamW performs 63 kernel launches vs 694 Muon, so less to gain). Nanochat doesn't stack/flatten params in AdamW either.
+
+Let's investigate the Perfetto trace:
+
+![](assets/stage_0a_full.png)    // dummy link for now, replace with copy of 3_dist showing reduced CPU overhead
+
+We can see CPU side optimizer blocks occupy much less time (specifically Muon). In a profiled run (slower than table runs), the number of kernel launches in AdamW reduced 63->9 (57 compute, 6 NCCL -> 3, 6) and for Muon reduced 694->157 (652 compute, 42 NCCL -> 151, 6).
+
+AdamW CPU side time reduced from 12.10->1.36ms (10.74ms, -88.8%) and Muon time reduced 312.37->70.09ms (242.28ms, -77.6%). There are small improvements on the GPU side as well: AdamW 4.40->3.84 (0.56ms, -12.7%) and Muon 42.57->37.57ms (5.00ms, -11.7%).
+
+In benchmark runs (different runs, slightly faster):
+
+| Stage | Step Time | Throughput | Max Memory | Final Loss (avg 10 steps) | Comment |
+|---|---:|---:|---:|---:|---|
+| 0_builtin | 529.2 ms | 495K tok/s | 67.8 GB | 6.1640 | PyTorch DDP with built-in AdamW/Muon |
+| 1_basic | 537.9 ms | 487K tok/s | 67.8 GB | 6.1637 | PyTorch DDP with hand-written AdamW/Muon |
+| 2_dist | 445.6 ms | 588K tok/s | 57.6 GB | 6.1636 | Naive ZeRO-2 style optimizers, comms inside optimizers |
+| 3_fused | 442.2 ms | 593K tok/s | 57.6 GB | 6.1635 | ZeRO-2 style optimizers with fused compute sections (torch.compile) |
+
+The throughput increased from 588K->593K tok/s (+X.XX%). As mentioned earlier, because GPU was already saturated, the benefit is not groundbreaking, but not nothing either. Notably we do not see peak memory increase. Likely staging buffers do not push memory above peak that was established in forward/backward pass, at least in synchronous case.
+
+Stage `3_fused` loss is close to previous stages, providing sanity check for the implementation.
 
 
 
