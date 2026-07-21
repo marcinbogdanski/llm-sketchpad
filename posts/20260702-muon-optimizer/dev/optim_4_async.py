@@ -193,15 +193,15 @@ class MuonAsync(torch.optim.Optimizer):
 
         temp_buffers = {}
 
-        # This will reduce scatter grads, such that each rank gets full averaged grad for owned param
+        # Reduce Scatter Grads - each rank gets full averaged grad for owned param
         for i, group in enumerate(self.param_groups):
-            p = group['params'][0]  # shape, dtype, device
-            padded_grads = pad_to_world_size([p.grad for p in group['params']], world_size)
-            padded_num_params = len(padded_grads)
-            num_params_per_rank = padded_num_params // world_size
+            p = group['params'][0]  # 'p' variable is used mainly as handle
 
-            stacked_all_grads = torch.stack(padded_grads)
-            stacked_grads = torch.empty(num_params_per_rank, *p.shape, dtype=p.dtype, device=p.device)
+            # Staging buffer 1
+            num_real = len(group['params'])                                   # real params, before padding
+            chunk_size = (num_real + world_size - 1) // world_size            # params per rank (ceil div)
+            stacked_all_grads = torch.stack(pad_to_world_size([p.grad for p in group['params']], world_size))
+            stacked_grads = torch.empty_like(stacked_all_grads[:chunk_size])  # this ranks chunk
 
             # Sync point 1
             reduce_scatter_future = torch.distributed.reduce_scatter_tensor(
@@ -220,34 +220,34 @@ class MuonAsync(torch.optim.Optimizer):
         
         # Do fused step for each param group
         for i, group in enumerate(self.param_groups):
-            p = group['params'][0]  # shape, dtype, device
-            num_params = len(group['params'])
-            padded_num_params = ((len(group['params']) + world_size - 1) // world_size) * world_size
-            num_params_per_rank = padded_num_params // world_size
+            p = group['params'][0]  # 'p' variable is used mainly as handle
+            num_real = len(group['params'])
+            chunk_size = (num_real + world_size - 1) // world_size
 
             # Wait and get buffers
             temp_buffers[i].pop('reduce_scatter_future').wait()
             stacked_grads = temp_buffers[i].pop('stacked_grads')
 
-            # Sync point 2
-            idx_start = num_params_per_rank * rank
-            padded_params = pad_to_world_size(list(group['params']), world_size)
-            stacked_params = torch.stack(padded_params[idx_start:idx_start+num_params_per_rank])
+            # Staging buffer 2
+            idx_start = chunk_size * rank
+            padded_all_params = pad_to_world_size(list(group['params']), world_size)
+            stacked_params = torch.stack(padded_all_params[idx_start:idx_start+chunk_size])  # this ranks chunk
 
-            # Create buffers
+            # Lazy init momentum buffers
             if 'momentum_buffer' not in self.state[p]:
                 self.state[p]['momentum_buffer'] = torch.zeros_like(stacked_params)
 
-            num_params_this_rank = min(num_params_per_rank, max(0, num_params - idx_start))
+            num_params_this_rank = min(chunk_size, max(0, num_real - idx_start))
             if num_params_this_rank > 0:
 
-                # Update
-                assert p.grad.ndim == 2
+                # Scale LR
                 lr = group['lr'] * (max(1, p.size(0) / p.size(1)))**0.5
 
-                # 0-D CPU tensors to avoid re-compilation when values change
+                # Convert to 0-D CPU tensors to avoid re-compilation when values change
                 lr = torch.tensor(lr, device='cpu', dtype=torch.float32)
                 momentum = torch.tensor(group['momentum'], device='cpu', dtype=torch.float32)
+
+                # Call Fused Step
                 fused_muon_step(
                     params=stacked_params[:num_params_this_rank],
                     grad=stacked_grads[:num_params_this_rank],
@@ -257,19 +257,19 @@ class MuonAsync(torch.optim.Optimizer):
                     steps=group['ns_steps']
                 )
 
-            # Reuse the stacked_all_grads buffer for params
+            # Sync point 2 - Reuse the stacked_all_grads buffer for params
             stacked_all_grads = temp_buffers[i]['stacked_all_grads']
             all_gather_future = torch.distributed.all_gather_into_tensor(
                 stacked_all_grads, stacked_params, async_op=True
             ).get_future()
             temp_buffers[i]['all_gather_future'] = all_gather_future
 
-        # Copy back params
+        # Copy back to actual params
         for i, group in enumerate(self.param_groups):
-            num_params = len(group['params'])
+            num_real = len(group['params'])
             temp_buffers[i].pop('all_gather_future').wait()
             stacked_all_grads = temp_buffers[i].pop('stacked_all_grads')
-            torch._foreach_copy_(group["params"], list(stacked_all_grads[:num_params].unbind(0)))
+            torch._foreach_copy_(group["params"], list(stacked_all_grads[:num_real].unbind(0)))
 
 
 
