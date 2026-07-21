@@ -358,7 +358,7 @@ Let's have a look at the Muon next:
 ```text
 muon_step():
     v = B * v + (1-B) * g            # momentum 
-    vv = B * v + (1-B) * g           # optional, Nesterov look-ahead (just lerp again)
+    vv = B * v + (1-B) * g           # Nesterov look-ahead (just lerp again)
     U = newton_schulz(vv)            # orthogonalize
     lr_adj = lr * sqrt(max(1, m/n))  # adjust for aspect ratio
     p = p - lr_adj * U               # update weights
@@ -372,7 +372,7 @@ newton_schulz(vv):
     return X
 ```
 
-Similar to AdamW, Muon also uses standard momentum (with optional Nesterov look-ahead), but the AdamW per-element second moment normalization (`1/sqrt(s)`) is replaced with matrix orthogonalization step. **This is why Muon operates on 2D matrices only**, and not individual elements like AdamW. The rough intuition is: raw gradient/momentum matrices are dominated by few large directions and orthogonalization counter that, so "small" directions also get meaningful "step size". Due to computational cost exact SVD is replaced with Newton–Schulz iteration. The aspect ratio adjustment keeps the update magnitude consistent across matrix aspect ratios. I won't pretend to understand this deeply enough to be able to explain, I take update math as given, and leave explanation to [Jordan Post](https://kellerjordan.github.io/posts/muon/).
+Similar to AdamW, Muon also uses standard momentum with Nesterov look-ahead, but the AdamW per-element second moment normalization (`1/sqrt(s)`) is replaced with matrix orthogonalization step. **This is why Muon operates on 2D matrices only**, and not individual elements like AdamW. The rough intuition is: raw gradient/momentum matrices are dominated by few large directions and orthogonalization counter that, so "small" directions also get meaningful "step size". Due to computational cost exact SVD is replaced with Newton–Schulz iteration. The aspect ratio adjustment keeps the update magnitude consistent across matrix aspect ratios. I won't pretend to understand this deeply enough to be able to explain, I take update math as given, and leave explanation to [Jordan Post](https://kellerjordan.github.io/posts/muon/).
 
 Below I'm including full Newton-Schulz and Muon code:
 
@@ -401,8 +401,8 @@ The `zeropower_via_newtonschulz()` is pure math and `ns_step=5` is held constant
 
 ```python
 class MuonBasic(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.01, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+    def __init__(self, params, lr=0.01, momentum=0.95, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps)
         super().__init__(params, defaults)
     
     @torch.no_grad()
@@ -423,7 +423,7 @@ class MuonBasic(torch.optim.Optimizer):
 
                 # Nesterov look-ahead
                 # vv = B*v + (1-B)*g
-                vv = p.grad.lerp(v, group['momentum']) if group['nesterov'] else v
+                vv = p.grad.lerp(v, group['momentum'])
 
                 # Calculate update
                 update = zeropower_via_newtonschulz(vv, group['ns_steps'])
@@ -754,4 +754,3 @@ Stage `3_fused` loss is close to previous stages, providing sanity check for the
 
 ---
 END OF DOC
-

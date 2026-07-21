@@ -150,13 +150,13 @@ class MuonFused(torch.optim.Optimizer):
     
     Algorithm:
         v = B * v + (1-B) * g            # momentum 
-        vv = B * v + (1-B) * g           # optional, Nesterov look-ahead (just lerp again)
+        vv = B * v + (1-B) * g           # Nesterov look-ahead (just lerp again)
         U = newton_schulz(vv)            # orthogonalize
         lr_adj = lr * sqrt(max(1, m/n))  # adjust for aspect ratio
         p = p - lr_adj * U               # update weights
     """
-    def __init__(self, params, lr=0.01, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+    def __init__(self, params, lr=0.01, momentum=0.95, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps)
         super().__init__(params, defaults)
     
     @torch.no_grad()
