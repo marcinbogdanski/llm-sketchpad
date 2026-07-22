@@ -1,3 +1,31 @@
+## 2026.07.22 AdamW Apparent Regression 3.8->7.7ms
+
+On 8xH200, d26 run, stages `3_fused`->`4_async`, the measured AdamW optimizer time seemingly regresses 3.8->7.7ms (doubles!)
+
+The problem is related to the fact that backward pass finishes at slightly different time across ranks. Then ranks enter AdamW block at different time, but first comm block forces them to sync. The ranks that entered early, present longer measured time.
+
+```
+Rank 0:  |--fwd--|---backward---|---adamw---|---muon---|
+Rank 1:  |--fwd--|---backward--|----adamw---|---muon---|
+Rank 2:  |--fwd--|---backward-----|-adamw---|---muon---|
+...
+```
+
+The AdamW entry point jitter on stage 3 run was on the order of ~10 ms. The whole AdamW step, only actual measured compute and comms is around ~3.8 ms. This means the measurement I got on rank 0 (also 3.8 ms) was pure luck. It just happened that rank 0 entered last, and through that AdamW block was the shortest. The longest AdamW on that run was ~14ms which checks out (~10ms jitter + ~3.8ms = ~14).
+
+This is less relevant for measuring fwd/bwd pass, since they are much longer than the jitter.
+
+Muon is not affected because entry point is synced due to preceding AdamW exit all-gather.
+
+The solution for the `--profile` runs is to add a `cuda.synchronize()` followed by `dist.barrier()` after backward pass.
+
+## ~2026.07.20 DDPOptimizer and Backward Pass
+
+On 8xH200, d26 run, stages `0_builtin`->`2_dist` (baseline vs removed DDP wrapper). backward pass shrinks from 297.7 -> 259.5 (~38ms, unexpected).
+
+The cause is: when using DDP wrapper, `DDPOptimizer` deliberately partitions compiled backward pass into chunks, so it can interleave it with comms. In our case that is 81 compiled graphs (chunks) vs 1 compiled graph without DDP Wrapper. Without the DDP wrapper the number of backward kernels is reduced 846->634. So it seems when using DDP wrapper we pay with graph fragmentation and extra housekeeping.
+
+
 ## 2026.07.15 Scaling Sweep and Perfetto Traces
 
 Captured scaling sweep, stages 0_builtin and 5_nanochat, for number of GPUs: 1, 2 and 4 on my 4x3090 rig. Few notes:

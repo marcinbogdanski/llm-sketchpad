@@ -369,6 +369,11 @@ def main():
                 loss = model(x, y)
             loss.backward()
         
+        # Profiler Guard
+        if args.profile:
+            torch.cuda.synchronize()
+            torch.distributed.barrier()  # align ranks before profiling AdamW/Muon step
+        
         # Optimizer step
         lrm = get_lr(i)
         for optimizer in optimizers:
