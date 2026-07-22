@@ -731,7 +731,7 @@ Regarding AdamW, similarly to Muon we implement fused step function, but we **do
 
 Let's investigate the Perfetto trace:
 
-![](assets/stage_0a_full.png)    // dummy link for now, replace with copy of 3_dist showing reduced CPU overhead
+![](assets/stage_0a_full.png)    // dummy link for now, replace with copy of 3_fused showing reduced CPU overhead
 
 We can see CPU side optimizer blocks occupy much less time (specifically Muon). In a profiled run (slower than table runs), the number of kernel launches in AdamW reduced 63->9 (57 compute, 6 NCCL -> 3, 6) and for Muon reduced 694->157 (652 compute, 42 NCCL -> 151, 6).
 
@@ -750,7 +750,114 @@ The throughput increased from 588K->593K tok/s (+X.XX%). As mentioned earlier, b
 
 Stage `3_fused` loss is close to previous stages, providing sanity check for the implementation.
 
+## Stage 4 - Async Communications
 
+Unfortunately we have another problem: comms in optimizers so far are synchronous and do not overlap with compute.
+
+![](assets/stage_0a_full.png)    // dummy link for now, zoom in of 3_fused showing Muon GPU side with compute/comms not overlapping
+
+Inspection of Perfetto traces for stage `3_fused` shows that on the GPU side Muon time in compute vs comms is 16.73 ms and 20.31 ms (44.5% and 54.1%) respectively. For AdamW we see 0.15 ms and 3.67 ms (3.9% and 95.5%). Let's see how much we can recover.
+
+```diff
+ def step(self):
+     rank = torch.distributed.get_rank()
+     world_size = torch.distributed.get_world_size()
+
++    temp_buffers = {}
+
+     # Reduce Scatter Grads - each rank gets full averaged grad for owned param
++    for i, group in enumerate(self.param_groups):
+
+         # Staging buffer 1
+         # ...
+        stacked_all_grads = ...
+        stacked_grads = ...       # this ranks chunk
+
+         # Sync point 1
+-        reduce_scatter_future = torch.distributed.reduce_scatter_tensor(
+-            output=stacked_grads,
+-            input=stacked_all_grads,
+-            async_op=True
+-        ).get_future()
+
+         # Temp buffers
++        temp_buffers[i] = {
++            'reduce_scatter_future': reduce_scatter_future,
++            'stacked_grads': stacked_grads,
++            'stacked_all_grads': stacked_all_grads,
++        }
+    
+     # NOTE: We have broken into two loops here, now that async comms is implemented
+
+     # Do fused step for each param group
++    for i, group in enumerate(self.param_groups):
+         p = group['params'][0]  # 'p' variable is used mainly as handle
+         num_real = len(group['params'])
+         chunk_size = (num_real + world_size - 1) // world_size
+ 
+         # Wait and get buffers
+-        temp_buffers[i].pop('reduce_scatter_future').wait()
++        stacked_grads = temp_buffers[i].pop('stacked_grads')
+ 
+         # Staging buffer 2
+         # ...
+         stacked_params = ...  # this ranks chunk
+ 
+         # Lazy init momentum buffers
+         # ...
+ 
+         num_params_this_rank = ...
+         if num_params_this_rank > 0:
+
+             # Scale LR
+             # ...
+ 
+             # Convert to 0-D CPU tensors to avoid re-compilation when values change
+             # ...
+ 
+             # Call Fused Step
+             fused_muon_step(
+                 params=stacked_params[:num_params_this_rank],
+                 grad=stacked_grads[:num_params_this_rank],
+                 ...
+             )
+ 
+         # Sync point 2 - Reuse the stacked_all_grads buffer for params
++        stacked_all_grads = temp_buffers[i]['stacked_all_grads']
+-        all_gather_future = torch.distributed.all_gather_into_tensor(
+-            stacked_all_grads,
+-            stacked_params,
+-            async_op=True
+-        ).get_future()
++        temp_buffers[i]['all_gather_future'] = all_gather_future
+ 
+     # Copy back to actual params
++    for i, group in enumerate(self.param_groups):
++        num_real = len(group['params'])
++        temp_buffers[i].pop('all_gather_future').wait()
++        stacked_all_grads = temp_buffers[i].pop('stacked_all_grads')
++        torch._foreach_copy_(group["params"], list(stacked_all_grads[:num_real].unbind(0)))
+```
+
+Previously (`3_fused`) we had single loop: reduce-scatter, optimizer step, all-gather, param copy. This is now replaced with three loops and asynchronous operations. The `temp_buffers` is introduced to hold futures and buffer references between the loops. Let's look in detail:
+
+- loop 1: prepares stacked buffers and initiates reduce-scatter. Note `async_op=True` and `.get_future()` to capture future for later use. Function call is non-blocking and moves on immediately. We need to track and later retrieve buffers create in all loop iterations, so we stash them in `temp_buffers`
+- loop 2: waits for its group reduce-scatter to complete (`.wait()`) and retrieves buffer from `temp_buffer`. Ten performs optimizer step. While doing so other comms are possibly still in-flight in the background. This is the overlap we want. After the step it issues all-gather, again in async mode, allowing it to possibly overlap with next iteration of compute. At the end we capture buffer reference for later. As before in stage `3_fused` we reuse `stacked_all_grads` to store params.
+- loop 3: as in `3_fused` we need to copy back the params, this loop captures comms results and does the copy.
+
+In other words: first loop dispatches all reduce-scatters. Second loop, as chunks arrive, does the step and dispatches results. Third loop collects the results. AdamW is treated with analogous refactor.
+
+![](assets/stage_0a_full.png)    // dummy link for now, replace with copy of 4_async showing Muon GPU side with compute/comms overlapping
+
+Looking at the perfetto plot the comms and compute in Muon indeed overlap.
+
+In the profiled run, Muon GPU time decreased from 37.57 to 27.20 ms (~10 ms gain, 27.6%). Notably in Muon compute adds up to 21.13 ms compute and comms to 25.82 ms, which now both fit in 27.2 ms total time, thanks to overlap. While overlap isn't free, it still wins.
+
+As for AdamW, looking at rank 0 only, time _appears_ to double 3.84 to 7.72 ms (total optimizer time).
+
+What the heck. No, something fishy going on.
 
 ---
 END OF DOC
+
+

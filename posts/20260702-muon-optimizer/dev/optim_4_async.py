@@ -218,6 +218,8 @@ class MuonAsync(torch.optim.Optimizer):
                 'stacked_all_grads': stacked_all_grads,
             }
         
+        # NOTE: We have broken into two loops here, now that async comms is implemented
+
         # Do fused step for each param group
         for i, group in enumerate(self.param_groups):
             p = group['params'][0]  # 'p' variable is used mainly as handle
