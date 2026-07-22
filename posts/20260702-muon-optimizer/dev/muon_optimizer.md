@@ -851,11 +851,49 @@ In other words: first loop dispatches all reduce-scatters. Second loop, as chunk
 
 Looking at the perfetto plot the comms and compute in Muon indeed overlap.
 
-In the profiled run, Muon GPU time decreased from 37.57 to 27.20 ms (~10 ms gain, 27.6%). Notably in Muon compute adds up to 21.13 ms compute and comms to 25.82 ms, which now both fit in 27.2 ms total time, thanks to overlap. While overlap isn't free, it still wins.
+In the profiled run, Muon GPU time decreased from 37.57 to 27.20 ms (~10 ms gain, 27.6%). Notably in Muon compute adds up to 21.13 ms and comms to 25.82 ms, which now both fit in 27.2 ms total time, thanks to overlap. While overlap isn't free, it still wins (27.2 total < 21.31 compute + 28.82 comms).
 
-As for AdamW, looking at rank 0 only, time _appears_ to double 3.84 to 7.72 ms (total optimizer time).
+<span style="color: red;">TODO: The H200 runs need to be re-done with barrier, below i assume numbers land just fine</span>
 
-What the heck. No, something fishy going on.
+As for AdamW, the time stays at approximately ~3.84 (X.XX, Y.YY stages `3_fused` and `4_async` respectively). This makes sense since AdamW compute is only ~0.15ms, so there is nothing to hide comms under.
+
+Footgun warning: Backward pass ends at slightly different time between ranks, introducing around ~10ms jitter. This is more than AdamW step time. To alleviate the jitter effect on AdamW measurement, I added `cuda.synchronize()` along with `dist.barrier()` after backward pass for `--profile` runs. Details in [LOG.md](LOG.md)
+
+Let's have a look at the table runs (again, these are w/o `--profile` so timings differ):
+
+| Stage | Step Time | Throughput | Max Memory | Final Loss (avg 10 steps) | Comment |
+|---|---:|---:|---:|---:|---|
+| 0_builtin | 529.2 ms | 495K tok/s | 67.8 GB | 6.1640 | PyTorch DDP with built-in AdamW/Muon |
+| 1_basic | 537.9 ms | 487K tok/s | 67.8 GB | 6.1637 | PyTorch DDP with hand-written AdamW/Muon |
+| 2_dist | 445.6 ms | 588K tok/s | 57.6 GB | 6.1636 | Naive ZeRO-2 style optimizers, comms inside optimizers |
+| 3_fused | 442.2 ms | 593K tok/s | 57.6 GB | 6.1635 | ZeRO-2 style optimizers with fused compute sections (torch.compile) |
+| 4_async | 436.5 ms | 601K tok/s | 62.9 GB | 6.1636 | ZeRO-2 style, fused compute, hide comms behind compute |
+
+_Table: recorded on 8xH200, model depth 26 (~1.03B), batch 32x1024 per GPU (262K tok/step)_
+
+It looks like we moved from 442.2->436.5 ms (`3_fused`->`4_async`, 5.7 ms, ~1%). It's a small but honest gain.
+
+Notably, the memory jumped 57.6->62.9 GB (still below DDP 67.8 GB). This is because in `3_fused` the intermediate buffers in the optimizers were created and destroyed in each loop iteration. In `4_async` optimizers create all buffers in the first loop, and pass them to second loop.
+
+As earlier, the loss 6.1636 sits in the middle of cluster of runs so far, sanity-confirming current code.
+
+#### Side Note
+
+When originally writing code for this section, I wrongly indented the code in Muon `step()`.
+
+This was fixed with following patch:
+
+```diff
+     # Copy back to actual params
+     for i, group in enumerate(self.param_groups):
+         num_real = len(group['params'])
+         temp_buffers[i].pop('all_gather_future').wait()
+         stacked_all_grads = temp_buffers[i].pop('stacked_all_grads')
+-    torch._foreach_copy_(group["params"], list(stacked_all_grads[:num_real].unbind(0)))
++        torch._foreach_copy_(group["params"], list(stacked_all_grads[:num_real].unbind(0)))
+```
+
+With `_foreach_copy_` after the for loop, only the last param group would copy back. All-but-last param groups were left untrained. The model as a whole _was_ training, loss was going down, but code was clearly not doing what it supposed to. The reason this was caught is because loss was noticeably under-trained compared to previous stages - immediate red flag.
 
 ---
 END OF DOC
