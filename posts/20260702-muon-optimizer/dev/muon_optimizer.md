@@ -526,7 +526,7 @@ There are two main changes:
 
 2) Comms - The `Sync point 1` does reduce-scatter to populate `grad_slice` with correct averaged gradient based on all 8 ranks. The `Sync point 2` all-gathers param slices across all ranks, ensuring param tensor is in sync across ranks after step completes. 
 
-In this stage both communication primitives are called synchronously - no overlap with compute (and definitely not with the backward pass). This is deliberate at this stage and will be addressed in stage `4_async`. Notably reduce-scatter followed by all-gather has same cost as all-reduce, which was done by DDP wrapper in earlier stages. So we did not add communication cost, but we moved it out of backward pass naively (for now) into optimizer step.
+In this stage both communication primitives are called synchronously - no overlap with compute (and definitely not with the backward pass). This is deliberate at this stage and will be addressed in stage `4_async`. Notably reduce-scatter followed by all-gather has same cost as all-reduce, which was done by DDP wrapper in earlier stages. So we did not add communication cost, but we moved it out of backward pass naively into optimizer step.
 
 Now let's have a look how to implement distributed Muon, and how it differs from AdamW:
 

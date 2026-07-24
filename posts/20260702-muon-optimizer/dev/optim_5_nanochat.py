@@ -67,11 +67,18 @@ def fused_muon_step(
     v.lerp_(grad, 1 - momentum)
     # Nesterov look-ahead: vv = B*v + (1-B)*g
     grad = grad.lerp(v, momentum)
+    X = grad.bfloat16()
+
+    # -----------------------
+    # MuonEq row equilibrium
+    # https://arxiv.org/abs/2603.28254
+    target = X.float().norm(dim=(-2, -1), keepdim=True) / (X.size(-2)**0.5)
+    row_norm = X.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    X = X * (target / row_norm).to(X.dtype)
 
     # --------------------------------
     # Polar express orthogonalization
     # https://arxiv.org/pdf/2505.16932
-    X = grad.bfloat16()
     # Ensure spectral norm is at most 1 (with 1% safety factor)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
     if grad.size(-2) > grad.size(-1):
@@ -87,6 +94,13 @@ def fused_muon_step(
             B = b * A + c * (A @ A)
             X = a * X + B @ X
     grad = X
+
+    # -----------------------
+    # Muon+ renormalization
+    # https://arxiv.org/abs/2602.21545
+    target_norm = min(grad.size(-2), grad.size(-1))**0.5
+    grad_norm = grad.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    grad = grad * (target_norm / grad_norm).to(grad.dtype)
 
     # ---------------------------------------------
     # Similar to NorMuon per row variance reduction
